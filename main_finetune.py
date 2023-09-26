@@ -32,6 +32,8 @@ import models_vit
 
 from engine_finetune import train_one_epoch, evaluate
 
+import wandb
+
 
 def get_args_parser():
     parser = argparse.ArgumentParser('MAE fine-tuning for image classification', add_help=False)
@@ -113,10 +115,10 @@ def get_args_parser():
                         help='Use class token instead of global pool for classification')
 
     # Dataset parameters
-    parser.add_argument('--data_path', default='/home/jupyter/Mor_DR_data/data/data/IDRID/Disease_Grading/', type=str,
+    parser.add_argument('--data_path', default='/home/dkuo/RetFound/tasks/referable_CFP_OCT/dataset', type=str,
                         help='dataset path')
-    parser.add_argument('--nb_classes', default=1000, type=int,
-                        help='number of the classification types')
+    parser.add_argument('--nb_classes', default=2, type=int,
+                        help='number of the classification types')  # abnormal vs. normal
 
     parser.add_argument('--output_dir', default='./output_dir',
                         help='path where to save, empty for no saving')
@@ -317,10 +319,18 @@ def main(args):
         test_stats,auc_roc = evaluate(data_loader_test, model, device, args.task, epoch=0, mode='test',num_class=args.nb_classes)
         exit(0)
 
+    #  W&B
+    wandb.init(
+        project="setup_retfound",
+        config=args,
+        sync_tensorboard=True,
+    )
+
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     max_accuracy = 0.0
     max_auc = 0.0
+
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
@@ -365,6 +375,8 @@ def main(args):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
+
+    wandb.finish()
 
 
 if __name__ == '__main__':
