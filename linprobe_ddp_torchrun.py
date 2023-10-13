@@ -5,9 +5,11 @@
 # https://github.com/facebookresearch/mae/tree/main
 #
 # Run with
-# > torchrun --standalone --nproc_per_node=4 lin_probe_ddp_torchrun.py [args]
+# > CUDA_VISIBLE_DEVICES=0,1,2 torchrun --standalone --nproc_per_node=gpu linprobe_ddp_torchrun.py [args]
+
 
 import argparse
+from contextlib import nullcontext
 import os
 
 import torch
@@ -28,6 +30,12 @@ from util.lars import LARS
 from util.pos_embed import interpolate_pos_embed
 import wandb
 
+CFP_CHKPT_PATH = "/home/dkuo/RetFound/model_checkpoints/RETFound_cfp_weights.pth"
+OCT_CHKPT_PATH = "/home/dkuo/RetFound/model_checkpoints/RETFound_oct_weights.pth"
+
+CFP_DATASET_PATH = "/home/dkuo/RetFound/tasks/referable_CFP_OCT/dataset/CFP"
+OCT_DATASET_PATH = "/home/dkuo/RetFound/tasks/referable_CFP_OCT/dataset/OCT"
+
 RETFOUND_EXPECTED_IMAGE_SIZE = 224
 
 
@@ -37,34 +45,41 @@ class Trainer:
             model: torch.nn.Module,
             train_dataloader: DataLoader,
             val_dataloader: DataLoader,
+            test_dataloader: DataLoader,
             optimizer: torch.optim.Optimizer,
             loss_fn,
             save_every: int,
             last_snapshot_path: str,
             best_snapshot_path: str,
             test_snapshot_path: str = None,
+            mixed_precision: bool = False,
     ) -> None:
+        # model, optimizer, loss
         self.gpu_id = int(os.environ["LOCAL_RANK"])
         self.model = model.to(self.gpu_id)
         self.model = DDP(self.model, device_ids=[self.gpu_id])
         self.optimizer = optimizer
         self.loss_fn = loss_fn
 
+        # mixed precision
+        self.mixed_precision = mixed_precision
+        self.scaler = torch.cuda.amp.GradScaler()  
+
+        # dataloaders
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
-                
+        self.test_dataloader = test_dataloader
+        
+        # training snapshots
         self.epochs_run = 0
         self.save_every = save_every
         self.last_snapshot_path = last_snapshot_path
+        self.best_snapshot_path = best_snapshot_path
+        self.test_snapshot_path = test_snapshot_path
+        self.best_val_ap = 0.0
         if os.path.exists(last_snapshot_path):
             print("Loading snapshot")
             self._load_snapshot(last_snapshot_path)
-
-        self.best_snapshot_path = best_snapshot_path
-        if not self.best_val_ap:
-            self.best_val_ap = 0.0
-        
-        self.test_snapshot_path = test_snapshot_path
 
     def _load_snapshot(self, snapshot_path: str) -> None:
         loc = f"cuda:{self.gpu_id}"
@@ -83,72 +98,92 @@ class Trainer:
         torch.save(snapshot, snapshot_path)
         print(f"Epoch {epoch} | Training snapshot saved at {snapshot_path}")
     
-
     def _train_batch(self, inputs, targets):
         self.model.train()
         self.optimizer.zero_grad()
+
+        with torch.autocast(device_type='cuda', dtype=torch.float16) if self.mixed_precision else nullcontext():
+            outputs = self.model(inputs)  # (batch_size, num_classes)
+            loss = self.loss_fn(outputs, targets)
+            print(f"Training loss before reduce:[GPU{self.gpu_id}] {loss}")
+            torch.distributed.reduce(loss, op=torch.distributed.ReduceOp.AVG, dst=0)  # avg loss across all GPUs and send to rank 0 process
+            print(f"Training loss after reduce:[GPU{self.gpu_id}] {loss}")
+            if self.gpu_id == 0:
+                wandb.log({"train_loss": loss})
         
-        # with torch.cuda.amp.autocast():  # mixed precision
-        outputs = self.model(input)
-        loss = self.loss_fn(outputs, targets)
-        wandb.log({"train_loss": loss})
-        
-        loss.backward()
-        self.optimizer.step()
+        if self.mixed_precision:
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            self.optimizer.step()
     
     def _validate(self, test=False):
-        metrics_dict = {"avg_loss": 0.0}
-        torchmetrics_dict = {
-            "auroc": metrics.BinaryAUROC(thresholds=None),
-            "ap": metrics.BinaryAveragePrecision(thresholds=None),
-            "precision": metrics.BinaryPrecision(thresholds=None),
-            "recall": metrics.BinaryRecall(thresholds=None),
-            "f1": metrics.BinaryF1Score(thresholds=None),
-            "accuracy": metrics.BinaryAccuracy(thresholds=None),
-        }
-
+        metrics_dict = {"avg_loss": torch.tensor([0.0]).to(self.gpu_id)}
+        torchmetrics_dict = torch.nn.ModuleDict({
+            "auroc": metrics.AUROC(task="multiclass", num_classes=2, thresholds=None),
+            "ap": metrics.AveragePrecision(task="multiclass", num_classes=2, thresholds=None),
+            "precision": metrics.Precision(task="multiclass", num_classes=2, thresholds=None),
+            "recall": metrics.Recall(task="multiclass", num_classes=2, thresholds=None),
+            "f1": metrics.F1Score(task="multiclass", num_classes=2, thresholds=None),
+            "accuracy": metrics.Accuracy(task="multiclass", num_classes=2, thresholds=None),
+        }).to(self.gpu_id)
+        
         dataloader = self.test_dataloader if test else self.val_dataloader
         
         self.model.eval()
-        with torch.no_grad():
-            for batch in dataloader:
-                inputs, targets = batch
-                inputs = inputs.to(self.gpu_id)
-                targets = targets.to(self.gpu_id)
-                outputs = self.model(inputs)
+        with torch.autocast(device_type='cuda', dtype=torch.float16) if self.mixed_precision else nullcontext():
+            with torch.no_grad():
+                for batch in dataloader:
+                    inputs, targets = batch
+                    inputs = inputs.to(self.gpu_id)
+                    targets = targets.to(self.gpu_id)
+                    outputs = self.model(inputs)  # (batch_size, num_classes)
+                    probs = F.softmax(outputs, dim=-1)
 
-                for metric, fn in torchmetrics_dict.items():
-                    fn(outputs, targets)
+                    metrics_dict["avg_loss"] += self.loss_fn(outputs, targets)  
+                    for metric, fn in torchmetrics_dict.items():
+                        fn(probs, targets)
         
         metrics_dict["avg_loss"] /= len(dataloader)
         for metric, fn in torchmetrics_dict.items():
             metrics_dict[metric] = fn.compute()
             fn.reset()
+        
+        print(f"Validation before reduce:[GPU{self.gpu_id}] {metrics_dict}")
 
-        if not test:
-            metrics_dict = {f"val_{metric}": value for metric, value in metrics_dict.items()}
+        for metric, value in metrics_dict.items():
+            torch.distributed.reduce(value, op=torch.distributed.ReduceOp.AVG, dst=0) # avg across all GPUs and send to rank 0 process
+        
+        if self.gpu_id == 0:
+            print(f"Validation after reduce: [GPU{self.gpu_id}] {metrics_dict}")
+            if not test:
+                metrics_dict = {f"val_{metric}": value.item() for metric, value in metrics_dict.items()}
+            else:  # test
+                metrics_dict = {f"test_{metric}": value.item() for metric, value in metrics_dict.items()}
             wandb.log(metrics_dict)
 
         return metrics_dict
 
     def _train_epoch(self, epoch):
         batch_size = len(next(iter(self.train_dataloader))[0])
-        print(f"[GPU{self.gpu_id}] Epoch {epoch} | Batch size {batch_size} | Steps: {len(self.train_data)}")
-        self.train_data.sampler.set_epoch(epoch)
+        print(f"[GPU{self.gpu_id}] Epoch {epoch} | Batch size {batch_size} | Steps: {len(self.train_dataloader)}")
+        self.train_dataloader.sampler.set_epoch(epoch)
         
         for batch in self.train_dataloader:
             inputs, targets = batch
             inputs = inputs.to(self.gpu_id)
             targets = targets.to(self.gpu_id)
             self._train_batch(inputs, targets)
-        
-        return self._validate()
 
     def train(self, max_epochs: int):
         for epoch in range(self.epochs_run, max_epochs):
-            metrics_dict = self._train_epoch(epoch)
+            self._train_epoch(epoch)
             self.epochs_run += 1
-            if self.gpu_id == 0: 
+            print(f"[GPU{self.gpu_id}] Epoch {epoch} | Running Validation")
+            metrics_dict = self._validate()
+            if self.gpu_id == 0:
                 if epoch % self.save_every == 0:
                     self._save_snapshot(epoch, self.last_snapshot_path)
                 if self.best_val_ap < metrics_dict["val_ap"]:
@@ -157,7 +192,8 @@ class Trainer:
     def test(self):
         self._load_snapshot(self.test_snapshot_path)
         metrics_dict = self._validate(test=True)
-        print(f"Test Set Performance: \n{metrics_dict}")
+        if self.gpu_id == 0:
+            print(f"Test Set Performance: \n{metrics_dict}")
 
 
 def setup_ddp():
@@ -204,84 +240,104 @@ def setup_data(dataset_path: str, batch_size: int):
     return train_dataloader, val_dataloader, test_dataloader
 
 
-def setup_model(checkpoint_path, arch='vit_large_patch16'):
+def setup_model(mae_checkpoint_path, arch='vit_large_patch16', num_classes=2, global_pool=False):
     # instantiate model
-    model = getattr(models_vit, arch)()
+    vit_model = models_vit.__dict__[arch](
+        num_classes=num_classes,
+        global_pool=global_pool,
+    )
     
     # load mae checkpoint
-    print(f"Loading checkpoint from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
-    checkpoint_model = checkpoint["model"]
-    state_dict = checkpoint_model.state_dict()
-
+    print(f"Loading model from {mae_checkpoint_path}")
+    mae_checkpoint = torch.load(mae_checkpoint_path, map_location='cpu')
+    mae_checkpoint_model = mae_checkpoint["model"]
+    state_dict = vit_model.state_dict()
+    
     # adapt mae model to vit model
     for k in ["head.weight", "head.bias"]:
-        if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
+        if k in mae_checkpoint_model and mae_checkpoint_model[k].shape != state_dict[k].shape:
             print(f"Removing key {k} from checkpoint due to shape mismatch")
-            del checkpoint_model[k]
-    
+            del mae_checkpoint_model[k]
+
     # interpolate position embedding following DeiT
-    interpolate_pos_embed(model, checkpoint_model)
+    interpolate_pos_embed(vit_model, mae_checkpoint_model)
     
-    msg = model.load_state_dict(checkpoint['model'], strict=False)
-    print(msg)
-    assert set(msg.missing_keys) == {"head.weight", "head.bias"}
+    msg = vit_model.load_state_dict(mae_checkpoint['model'], strict=False)
+    # print(msg)
+
+    if global_pool:
+        assert set(msg.missing_keys) == {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}
+    else:
+        assert set(msg.missing_keys) == {"head.weight", "head.bias"}
 
     # manually initialize head fc layer following MoCo v3
-    trunc_normal_(model.head.weight, std=.02)
+    trunc_normal_(vit_model.head.weight, std=.02)
 
     # hack for linear probe: revise model head with batchnorm
-    model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), model.head)
-
+    vit_model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(vit_model.head.in_features, affine=False, eps=1e-6), vit_model.head)
+    
     # freeze all parameters but the head
-    for name, param in model.named_parameters():
+    for name, param in vit_model.named_parameters():
         param.requires_grad = False
-    for name, param in model.head.named_parameters():
+    for name, param in vit_model.head.named_parameters():
         param.requires_grad = True
     
-    return model
+    return vit_model
 
 
 def setup_optimizer(model, lr=0.03, weight_decay=0):
     optimizer = LARS(model.head.parameters(), lr, weight_decay)
-    print(optimizer)
+    # torch.optim.AdamW(model.head.parameters(), lr=lr, weight_decay=weight_decay)
+    # print(optimizer)
     return optimizer
 
 
 def setup_loss_fn():
-    return F.cross_entropy()
+    # CFP training set has 102 abnormal and 548 normal (0.19)
+    # OCT training set has 132 abnormal and 782 normal (0.17)
+    class_weights = torch.tensor([5.0, 1.0]).cuda()  # [abnormal, normal]
+    return torch.nn.CrossEntropyLoss(weight=class_weights)  
 
 
 def main(args):
     setup_ddp()
     torch.manual_seed(0)
 
-    # Set up training objects
-    train_dataloader, val_dataloader, test_dataloader = setup_data(args.dataset_path, args.batch_size)
-    model = setup_model(args.snapshot_path)
-    loss_fn = setup_loss_fn()
-    optimizer = setup_optimizer(model, lr=args.lr, weight_decay=args.weight_decay)
+    # Set up correct pretrained model and dataset paths for modality
+    assert args.modality in ["CFP", "OCT"], "Modality must be CFP or OCT"
+    mae_checkpoint_path = CFP_CHKPT_PATH if args.modality == "CFP" else OCT_CHKPT_PATH
+    dataset_path = args.dataset_path if args.dataset_path else (CFP_DATASET_PATH if args.modality == "CFP" else OCT_DATASET_PATH) 
 
-    #  Set up W&B logging
-    wandb.init(
-        project="retfound_referable_cfp_oct",
-        config=args,
-    )
+    # Set up training objects
+    train_dataloader, val_dataloader, test_dataloader = setup_data(dataset_path, args.batch_size)
+    model = setup_model(mae_checkpoint_path)
+    loss_fn = setup_loss_fn()
+    optimizer = setup_optimizer(model, lr=args.learning_rate, weight_decay=args.weight_decay)
+
+    #  Set up W&B logging 
+    gpu_id = int(os.environ["LOCAL_RANK"])
+    if gpu_id == 0:  # only log on main process
+        wandb.init(
+            project="retfound_referable_cfp_oct",
+            config=args,
+        )
 
     # Set up trainer
     trainer = Trainer(
-        model, 
-        train_dataloader,
-        val_dataloader,
-        optimizer,
-        loss_fn,
-        args.save_every,
-        args.last_snapshot_path,
-        args.best_snapshot_path,
-        args.test_snapshot_path,
+        model=model, 
+        train_dataloader=train_dataloader,
+        val_dataloader=val_dataloader,
+        test_dataloader=test_dataloader,
+        optimizer=optimizer,
+        loss_fn=loss_fn,
+        mixed_precision=args.mixed_precision,
+        save_every=args.save_every,
+        last_snapshot_path=args.last_snapshot_path,
+        best_snapshot_path=args.best_snapshot_path,
+        test_snapshot_path=args.final_test_snapshot_path,
     )
     
-    if args.test_snapshot_path:
+    if args.final_test_snapshot_path:
         trainer.test()
         return
     
@@ -295,22 +351,27 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--total_epochs', type=int, help='Total epochs to train the model')
-    parser.add_argument('--save_every', default=1, type=int, help='How often to save a snapshot')
-    parser.add_argument('--batch_size', default=32, type=int, help='Input batch size on each device (default: 32)')
-    parser.add_argument('--last_snapshot_path', type=str, help='Path to last training snapshot')
-    parser.add_argument('--best_snapshot_path', type=str, help='Path to best snapshot so far')
-    parser.add_argument('--test_snapshot_path', type=str, help='Evaluate snapshot at provided path on final test set.')
+    parser.add_argument('--modality', type=str, default="CFP", help='Must be CFP or OCT')
+    parser.add_argument('--mixed_precision', action='store_true', help='Use automatic mixed precision')
+    parser.add_argument('--total_epochs', type=int, default=10, help='Total epochs to train the model')
+    parser.add_argument('--save_every', type=int, default=1, help='Save a snapshot every _ epochs')
+        
+    # Hyperparameters
+    parser.add_argument('--batch_size', type=int, default=1024, help='Input batch size on each device')
+    parser.add_argument('--learning_rate', type=float, default=0.03, help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=0, help='Weight decay')
+
+    # Paths
+    parser.add_argument('--dataset_path', type=str, help='Path to root directory of PyTorch ImageFolder dataset')
+    parser.add_argument('--last_snapshot_path', type=str,
+                        default="/home/dkuo/RetFound/tasks/referable_CFP_OCT/snapshots/linprobe_CFP_last.pth", 
+                        help='Path to last training snapshot')
+    parser.add_argument('--best_snapshot_path', type=str, 
+                        default="/home/dkuo/RetFound/tasks/referable_CFP_OCT/snapshots/linprobe_CFP_best.pth",
+                        help='Path to best snapshot so far')
+    parser.add_argument('--final_test_snapshot_path', type=str, help='Evaluate snapshot at provided path on final test set.')
     args = parser.parse_args()
     main(args)
 
 # Run with
-# > torchrun --standalone --nproc_per_node=4 lin_probe_ddp_torchrun.py [args]
-
-"""
-TODO:
-- test
-- W&B
-- mixed precision
-- hydra
-"""
+# > CUDA_VISIBLE_DEVICES=0,1,2 torchrun --standalone --nproc_per_node=gpu linprobe_ddp_torchrun.py [args]
