@@ -3,14 +3,12 @@
 # and from the PyTorch implementation of "Masked Autoencoders Are Scalable Vision Learners"
 # https://arxiv.org/abs/2111.06377
 # https://github.com/facebookresearch/mae/tree/main
-#
-# Run with
-# > CUDA_VISIBLE_DEVICES=0,1,2 torchrun --standalone --nproc_per_node=gpu linprobe_ddp_torchrun.py [args]
 
 
 import argparse
 from contextlib import nullcontext
 import os
+import pprint
 
 import torch
 from torch.distributed import init_process_group, destroy_process_group
@@ -89,7 +87,7 @@ class Trainer:
         self.best_val_ap = snapshot["BEST_VAL_AP"]
         print(f"Successfully loaded snapshot from Epoch {self.epochs_run}")
     
-    def _save_snapshot(self, epoch, snapshot_path):
+    def _save_snapshot(self, epoch: int, snapshot_path: str):
         snapshot = {
             "MODEL_STATE": self.model.module.state_dict(),  # actual model is module wrapped by DDP
             "EPOCHS_RUN": epoch,
@@ -98,14 +96,13 @@ class Trainer:
         torch.save(snapshot, snapshot_path)
         print(f"Epoch {epoch} | Training snapshot saved at {snapshot_path}")
     
-    def _train_batch(self, inputs, targets):
+    def _train_batch(self, inputs: torch.Tensor, targets: torch.Tensor):
         self.model.train()
         self.optimizer.zero_grad()
 
         with torch.autocast(device_type='cuda', dtype=torch.float16) if self.mixed_precision else nullcontext():
             outputs = self.model(inputs)  # (batch_size, num_classes)
             loss = self.loss_fn(outputs, targets)
-            print(f"Training loss before reduce:[GPU{self.gpu_id}] {loss}")
             torch.distributed.reduce(loss, op=torch.distributed.ReduceOp.AVG, dst=0)  # avg loss across all GPUs and send to rank 0 process
             print(f"Training loss after reduce:[GPU{self.gpu_id}] {loss}")
             if self.gpu_id == 0:
@@ -119,7 +116,7 @@ class Trainer:
             loss.backward()
             self.optimizer.step()
     
-    def _validate(self, test=False):
+    def _validate(self, test: bool = False):
         metrics_dict = {"avg_loss": torch.tensor([0.0]).to(self.gpu_id)}
         torchmetrics_dict = torch.nn.ModuleDict({
             "auroc": metrics.AUROC(task="multiclass", num_classes=2, thresholds=None),
@@ -150,14 +147,12 @@ class Trainer:
         for metric, fn in torchmetrics_dict.items():
             metrics_dict[metric] = fn.compute()
             fn.reset()
-        
-        print(f"Validation before reduce:[GPU{self.gpu_id}] {metrics_dict}")
 
         for metric, value in metrics_dict.items():
             torch.distributed.reduce(value, op=torch.distributed.ReduceOp.AVG, dst=0) # avg across all GPUs and send to rank 0 process
         
         if self.gpu_id == 0:
-            print(f"Validation after reduce: [GPU{self.gpu_id}] {metrics_dict}")
+            pprint(f"Validation metrics: [GPU{self.gpu_id}] {metrics_dict}")
             if not test:
                 metrics_dict = {f"val_{metric}": value.item() for metric, value in metrics_dict.items()}
             else:  # test
@@ -166,7 +161,7 @@ class Trainer:
 
         return metrics_dict
 
-    def _train_epoch(self, epoch):
+    def _train_epoch(self, epoch: int):
         batch_size = len(next(iter(self.train_dataloader))[0])
         print(f"[GPU{self.gpu_id}] Epoch {epoch} | Batch size {batch_size} | Steps: {len(self.train_dataloader)}")
         self.train_dataloader.sampler.set_epoch(epoch)
@@ -240,7 +235,16 @@ def setup_data(dataset_path: str, batch_size: int):
     return train_dataloader, val_dataloader, test_dataloader
 
 
-def setup_model(mae_checkpoint_path, arch='vit_large_patch16', num_classes=2, global_pool=False):
+def setup_model(
+        mae_checkpoint_path: str, 
+        training_strategy: str,
+        arch: str ='vit_large_patch16', 
+        num_classes: int = 2, 
+        global_pool: bool = False,
+    ):
+
+    assert args.training_strategy in ["full_finetune", "linear_probe"], "Training strategy must be full_finetune, or linear_probe"
+
     # instantiate model
     vit_model = models_vit.__dict__[arch](
         num_classes=num_classes,
@@ -273,29 +277,33 @@ def setup_model(mae_checkpoint_path, arch='vit_large_patch16', num_classes=2, gl
     # manually initialize head fc layer following MoCo v3
     trunc_normal_(vit_model.head.weight, std=.02)
 
-    # hack for linear probe: revise model head with batchnorm
-    vit_model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(vit_model.head.in_features, affine=False, eps=1e-6), vit_model.head)
+    if training_strategy == "linear_probe":
+        # hack for linear probe: revise model head with batchnorm
+        vit_model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(vit_model.head.in_features, affine=False, eps=1e-6), vit_model.head)
     
-    # freeze all parameters but the head
-    for name, param in vit_model.named_parameters():
-        param.requires_grad = False
-    for name, param in vit_model.head.named_parameters():
-        param.requires_grad = True
+        # freeze all parameters but the head
+        for name, param in vit_model.named_parameters():
+            param.requires_grad = False
+        for name, param in vit_model.head.named_parameters():
+            param.requires_grad = True
     
     return vit_model
 
 
-def setup_optimizer(model, lr=0.03, weight_decay=0):
-    optimizer = LARS(model.head.parameters(), lr, weight_decay)
-    # torch.optim.AdamW(model.head.parameters(), lr=lr, weight_decay=weight_decay)
+def setup_optimizer(model, training_strategy: str, lr=0.03, weight_decay=0):
+    if training_strategy == "linear_probe":
+        optimizer = LARS(model.head.parameters(), lr, weight_decay)
+    else:  # training_strategy == "full_finetune"
+        optimizer = LARS(model.parameters(), lr, weight_decay)
+        # torch.optim.AdamW(model.head.parameters(), lr=lr, weight_decay=weight_decay)
     # print(optimizer)
     return optimizer
 
 
 def setup_loss_fn():
-    # CFP training set has 102 abnormal and 548 normal (0.19)
-    # OCT training set has 132 abnormal and 782 normal (0.17)
-    class_weights = torch.tensor([5.0, 1.0]).cuda()  # [abnormal, normal]
+    # CFP training set has 548 normal and 102 referable (0.19)
+    # OCT training set has 782 normal and 132 referable (0.17)
+    class_weights = torch.tensor([1.0, 5.0]).cuda()  # [normal, referable]
     return torch.nn.CrossEntropyLoss(weight=class_weights)  
 
 
@@ -310,9 +318,9 @@ def main(args):
 
     # Set up training objects
     train_dataloader, val_dataloader, test_dataloader = setup_data(dataset_path, args.batch_size)
-    model = setup_model(mae_checkpoint_path)
+    model = setup_model(mae_checkpoint_path, training_strategy=args.training_strategy)
+    optimizer = setup_optimizer(model, training_strategy=args.training_strategy, lr=args.learning_rate, weight_decay=args.weight_decay)
     loss_fn = setup_loss_fn()
-    optimizer = setup_optimizer(model, lr=args.learning_rate, weight_decay=args.weight_decay)
 
     #  Set up W&B logging 
     gpu_id = int(os.environ["LOCAL_RANK"])
@@ -337,41 +345,44 @@ def main(args):
         test_snapshot_path=args.final_test_snapshot_path,
     )
     
+    # Test if given a final test snapshot
     if args.final_test_snapshot_path:
         trainer.test()
-        return
-    
     # Train
-    trainer.train(args.total_epochs)
+    else: 
+        trainer.train(args.total_epochs)
 
     # Clean up
     wandb.finish()
     destroy_process_group()
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+
+    # Task parameters
     parser.add_argument('--modality', type=str, default="CFP", help='Must be CFP or OCT')
-    parser.add_argument('--mixed_precision', action='store_true', help='Use automatic mixed precision')
-    parser.add_argument('--total_epochs', type=int, default=10, help='Total epochs to train the model')
-    parser.add_argument('--save_every', type=int, default=1, help='Save a snapshot every _ epochs')
+    parser.add_argument('--dataset_path', type=str, help='Path to root directory of PyTorch ImageFolder dataset')   
         
-    # Hyperparameters
-    parser.add_argument('--batch_size', type=int, default=1024, help='Input batch size on each device')
-    parser.add_argument('--learning_rate', type=float, default=0.03, help='Learning rate')
+    # Training Hyperparameters
+    parser.add_argument('--total_epochs', type=int, default=10, help='Total epochs to train the model')
+    parser.add_argument('--batch_size', type=int, default=64, help='Input batch size on each device')  # max batch_size with AMP {full_finetune: 64, linear_probe: 1024+}
+    parser.add_argument('--learning_rate', type=float, default=0.1, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0, help='Weight decay')
+    parser.add_argument('--mixed_precision', type=bool, default=True, help='Use automatic mixed precision')
+    parser.add_argument('--training_strategy', type=str, default="full_finetune", help="Training strategy: full_finetune, linear_probe")
+    parser.add_argument('--save_every', type=int, default=1, help='Save a snapshot every _ epochs')
 
     # Paths
-    parser.add_argument('--dataset_path', type=str, help='Path to root directory of PyTorch ImageFolder dataset')
     parser.add_argument('--last_snapshot_path', type=str,
-                        default="/home/dkuo/RetFound/tasks/referable_CFP_OCT/snapshots/linprobe_CFP_last.pth", 
+                        default="/home/dkuo/RetFound/tasks/referable_CFP_OCT/snapshots/last.pth", 
                         help='Path to last training snapshot')
     parser.add_argument('--best_snapshot_path', type=str, 
-                        default="/home/dkuo/RetFound/tasks/referable_CFP_OCT/snapshots/linprobe_CFP_best.pth",
+                        default="/home/dkuo/RetFound/tasks/referable_CFP_OCT/snapshots/best.pth",
                         help='Path to best snapshot so far')
     parser.add_argument('--final_test_snapshot_path', type=str, help='Evaluate snapshot at provided path on final test set.')
+
     args = parser.parse_args()
     main(args)
 
-# Run with
-# > CUDA_VISIBLE_DEVICES=0,1,2 torchrun --standalone --nproc_per_node=gpu linprobe_ddp_torchrun.py [args]
+# Run on all of 3 visible GPUs on 1 machine: 
+# > CUDA_VISIBLE_DEVICES=0,1,2 torchrun --standalone --nproc_per_node=gpu main_ddp_torchrun.py [args]
