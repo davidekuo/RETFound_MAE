@@ -8,7 +8,7 @@
 import argparse
 from contextlib import nullcontext
 import os
-import pprint
+from pprint import pprint
 
 import torch
 from torch.distributed import init_process_group, destroy_process_group
@@ -19,11 +19,10 @@ from torch.utils.data.distributed import DistributedSampler
 import torchmetrics.classification as metrics
 from torchvision import datasets, transforms
 
-from timm.data import create_transform
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.models.layers import trunc_normal_
 
-import models_mae, models_vit
+import models_vit
 from util.lars import LARS
 from util.pos_embed import interpolate_pos_embed
 import wandb
@@ -45,7 +44,8 @@ class Trainer:
             val_dataloader: DataLoader,
             test_dataloader: DataLoader,
             optimizer: torch.optim.Optimizer,
-            loss_fn,
+            scheduler: torch.optim.lr_scheduler,
+            loss_fn: torch.nn.Module,
             save_every: int,
             last_snapshot_path: str,
             best_snapshot_path: str,
@@ -57,6 +57,7 @@ class Trainer:
         self.model = model.to(self.gpu_id)
         self.model = DDP(self.model, device_ids=[self.gpu_id])
         self.optimizer = optimizer
+        self.scheduler = scheduler
         self.loss_fn = loss_fn
 
         # mixed precision
@@ -80,6 +81,7 @@ class Trainer:
             self._load_snapshot(last_snapshot_path)
 
     def _load_snapshot(self, snapshot_path: str) -> None:
+        """ Load snapshot of model """
         loc = f"cuda:{self.gpu_id}"
         snapshot = torch.load(snapshot_path, map_location=loc)
         self.model.load_state_dict(snapshot["MODEL_STATE"])
@@ -88,6 +90,7 @@ class Trainer:
         print(f"Successfully loaded snapshot from Epoch {self.epochs_run}")
     
     def _save_snapshot(self, epoch: int, snapshot_path: str):
+        """ Save snapshot of current model """
         snapshot = {
             "MODEL_STATE": self.model.module.state_dict(),  # actual model is module wrapped by DDP
             "EPOCHS_RUN": epoch,
@@ -97,16 +100,23 @@ class Trainer:
         print(f"Epoch {epoch} | Training snapshot saved at {snapshot_path}")
     
     def _train_batch(self, inputs: torch.Tensor, targets: torch.Tensor):
+        """ Train on one batch """
         self.model.train()
         self.optimizer.zero_grad()
 
         with torch.autocast(device_type='cuda', dtype=torch.float16) if self.mixed_precision else nullcontext():
             outputs = self.model(inputs)  # (batch_size, num_classes)
             loss = self.loss_fn(outputs, targets)
-            torch.distributed.reduce(loss, op=torch.distributed.ReduceOp.AVG, dst=0)  # avg loss across all GPUs and send to rank 0 process
+            preds = torch.argmax(outputs, dim=-1)  # (batch_size)
+            train_acc = torch.sum(preds == targets) / len(targets)
+
+            # avg across all GPUs and send to rank 0 process
+            torch.distributed.reduce(loss, op=torch.distributed.ReduceOp.AVG, dst=0)
+            torch.distributed.reduce(train_acc, op=torch.distributed.ReduceOp.AVG, dst=0)
             print(f"Training loss after reduce:[GPU{self.gpu_id}] {loss}")
+            print(f"Training acc after reduce:[GPU{self.gpu_id}] {train_acc}")
             if self.gpu_id == 0:
-                wandb.log({"train_loss": loss})
+                wandb.log({"train_loss": loss, "train_acc": train_acc})
         
         if self.mixed_precision:
             self.scaler.scale(loss).backward()
@@ -117,14 +127,16 @@ class Trainer:
             self.optimizer.step()
     
     def _validate(self, test: bool = False):
+        """ Validate current model on validation or final test dataset"""
         metrics_dict = {"avg_loss": torch.tensor([0.0]).to(self.gpu_id)}
         torchmetrics_dict = torch.nn.ModuleDict({
-            "auroc": metrics.AUROC(task="multiclass", num_classes=2, thresholds=None),
-            "ap": metrics.AveragePrecision(task="multiclass", num_classes=2, thresholds=None),
-            "precision": metrics.Precision(task="multiclass", num_classes=2, thresholds=None),
-            "recall": metrics.Recall(task="multiclass", num_classes=2, thresholds=None),
-            "f1": metrics.F1Score(task="multiclass", num_classes=2, thresholds=None),
-            "accuracy": metrics.Accuracy(task="multiclass", num_classes=2, thresholds=None),
+            "auroc": metrics.AUROC(task="multiclass", num_classes=2,thresholds=None),
+            "ap": metrics.AveragePrecision(task="multiclass", num_classes=2,thresholds=None),
+            "precision": metrics.Precision(task="multiclass", num_classes=2, average="macro", thresholds=None),
+            "recall": metrics.Recall(task="multiclass", num_classes=2, average="macro", thresholds=None),
+            "f1": metrics.F1Score(task="multiclass", num_classes=2, average="macro", thresholds=None),
+            "accuracy": metrics.Accuracy(task="multiclass", num_classes=2, average="macro", thresholds=None),
+            # set average="macro" per https://github.com/Lightning-AI/torchmetrics/issues/543
         }).to(self.gpu_id)
         
         dataloader = self.test_dataloader if test else self.val_dataloader
@@ -162,6 +174,7 @@ class Trainer:
         return metrics_dict
 
     def _train_epoch(self, epoch: int):
+        """ Train for one epoch """
         batch_size = len(next(iter(self.train_dataloader))[0])
         print(f"[GPU{self.gpu_id}] Epoch {epoch} | Batch size {batch_size} | Steps: {len(self.train_dataloader)}")
         self.train_dataloader.sampler.set_epoch(epoch)
@@ -171,8 +184,11 @@ class Trainer:
             inputs = inputs.to(self.gpu_id)
             targets = targets.to(self.gpu_id)
             self._train_batch(inputs, targets)
+        
+        self.scheduler.step()  # update learning rate every epoch
 
     def train(self, max_epochs: int):
+        """ Train for max_epochs """
         for epoch in range(self.epochs_run, max_epochs):
             self._train_epoch(epoch)
             self.epochs_run += 1
@@ -185,6 +201,7 @@ class Trainer:
                     self._save_snapshot(epoch, self.best_snapshot_path)
     
     def test(self):
+        """ Test on final test set """
         self._load_snapshot(self.test_snapshot_path)
         metrics_dict = self._validate(test=True)
         if self.gpu_id == 0:
@@ -192,11 +209,13 @@ class Trainer:
 
 
 def setup_ddp():
+    """ Set up distributed data parallel (DDP) training """
     init_process_group(backend="nccl")
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
 
 def setup_data_transforms():
+    """ Set up data transforms (based on ImageNet dataset) """
     mean = IMAGENET_DEFAULT_MEAN
     std = IMAGENET_DEFAULT_STD
     t = []
@@ -212,6 +231,19 @@ def setup_data_transforms():
 
 
 def setup_dataloader(dataset: Dataset, batch_size: int):
+    """
+    Parameters
+    ----------
+    dataset : torch.utils.data.Dataset
+        Dataset to load
+    batch_size : int
+        Batch size for dataloader
+    
+    Returns
+    -------
+    dataloader : torch.utils.data.DataLoader
+        Dataloader for dataset
+    """
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -221,12 +253,31 @@ def setup_dataloader(dataset: Dataset, batch_size: int):
     )
 
 
-def setup_data(dataset_path: str, batch_size: int):
+def setup_data(dataset_path: str, batch_size: int, dataset_size: int = None):
+    """
+    Parameters
+    ----------
+    dataset_path : str
+        Path to root directory of PyTorch ImageFolder dataset
+    batch_size : int
+        Batch size for dataloaders
+    dataset_size : int, optional
+        Number of images to sample from the training set. Use all images if not specified.
+    
+    Returns
+    -------
+    train_dataloader, val_dataloader, test_dataloader : torch.utils.data.DataLoader
+        Dataloaders for training, validation, and test sets
+    """
     # Set up datasets
     train_dataset = datasets.ImageFolder(dataset_path + "/train", transform=setup_data_transforms())
     val_dataset = datasets.ImageFolder(dataset_path + "/val", transform=setup_data_transforms())
     test_dataset = datasets.ImageFolder(dataset_path + "/test", transform=setup_data_transforms())
 
+    # If specified, take a random subset of the training dataset of size 'dataset_size' 
+    if dataset_size:
+        train_dataset = torch.utils.data.Subset(train_dataset, torch.randperm(len(train_dataset))[:dataset_size])
+    
     # Set up dataloaders
     train_dataloader = setup_dataloader(train_dataset, args.batch_size)
     val_dataloader = setup_dataloader(val_dataset, args.batch_size)
@@ -238,10 +289,29 @@ def setup_data(dataset_path: str, batch_size: int):
 def setup_model(
         mae_checkpoint_path: str, 
         training_strategy: str,
-        arch: str ='vit_large_patch16', 
+        arch: str = 'vit_large_patch16', 
         num_classes: int = 2, 
         global_pool: bool = False,
     ):
+    """
+    Parameters
+    ----------
+    mae_checkpoint_path : str
+        Path to checkpoint of MAE model
+    training_strategy : str
+        Training strategy: full_finetune, linear_probe
+    arch : str, optional
+        Architecture of ViT model, by default 'vit_large_patch16'
+    num_classes : int, optional
+        Number of classes, by default 2
+    global_pool : bool, optional
+        Whether to use global average pooling, by default False
+    
+    Returns
+    -------
+    vit_model : torch.nn.Module
+        ViT model
+    """
 
     assert args.training_strategy in ["full_finetune", "linear_probe"], "Training strategy must be full_finetune, or linear_probe"
 
@@ -290,17 +360,46 @@ def setup_model(
     return vit_model
 
 
-def setup_optimizer(model, training_strategy: str, lr=0.03, weight_decay=0):
+def setup_optimizer(model: torch.nn.Module, training_strategy: str, lr: float, weight_decay: float, total_epochs: int):
+    """
+    Parameters
+    ----------
+    model : torch.nn.Module
+        Model to train
+    training_strategy : str
+        Training strategy: full_finetune, linear_probe
+    lr : float
+        Learning rate
+    weight_decay : float
+        Weight decay
+    
+    Returns
+    -------
+    optimizer : torch.optim.Optimizer
+        Optimizer for training
+    scheduler : torch.optim.lr_scheduler
+        Learning rate scheduler
+    """
     if training_strategy == "linear_probe":
         optimizer = LARS(model.head.parameters(), lr, weight_decay)
+        # torch.optim.AdamW(model.head.parameters(), lr=lr, weight_decay=weight_decay)
     else:  # training_strategy == "full_finetune"
         optimizer = LARS(model.parameters(), lr, weight_decay)
-        # torch.optim.AdamW(model.head.parameters(), lr=lr, weight_decay=weight_decay)
+        # torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     # print(optimizer)
-    return optimizer
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs)
+
+    return optimizer, scheduler
 
 
 def setup_loss_fn():
+    """
+    Returns
+    -------
+    loss_fn : torch.nn.Module
+        Loss function for training
+    """
     # CFP training set has 548 normal and 102 referable (0.19)
     # OCT training set has 782 normal and 132 referable (0.17)
     class_weights = torch.tensor([1.0, 5.0]).cuda()  # [normal, referable]
@@ -317,9 +416,15 @@ def main(args):
     dataset_path = args.dataset_path if args.dataset_path else (CFP_DATASET_PATH if args.modality == "CFP" else OCT_DATASET_PATH) 
 
     # Set up training objects
-    train_dataloader, val_dataloader, test_dataloader = setup_data(dataset_path, args.batch_size)
-    model = setup_model(mae_checkpoint_path, training_strategy=args.training_strategy)
-    optimizer = setup_optimizer(model, training_strategy=args.training_strategy, lr=args.learning_rate, weight_decay=args.weight_decay)
+    train_dataloader, val_dataloader, test_dataloader = setup_data(dataset_path, args.batch_size, args.dataset_size)
+    model = setup_model(mae_checkpoint_path, training_strategy=args.training_strategy, global_pool=args.global_average_pooling)
+    optimizer, scheduler = setup_optimizer(
+        model, 
+        training_strategy=args.training_strategy, 
+        lr=args.learning_rate, 
+        weight_decay=args.weight_decay, 
+        total_epochs=args.total_epochs
+    )
     loss_fn = setup_loss_fn()
 
     #  Set up W&B logging 
@@ -328,6 +433,7 @@ def main(args):
         wandb.init(
             project="retfound_referable_cfp_oct",
             config=args,
+            resume=True,  # continue logging from previous run if did not successfully finish
         )
 
     # Set up trainer
@@ -337,6 +443,7 @@ def main(args):
         val_dataloader=val_dataloader,
         test_dataloader=test_dataloader,
         optimizer=optimizer,
+        scheduler=scheduler,
         loss_fn=loss_fn,
         mixed_precision=args.mixed_precision,
         save_every=args.save_every,
@@ -356,25 +463,28 @@ def main(args):
     wandb.finish()
     destroy_process_group()
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     # Task parameters
-    parser.add_argument('--modality', type=str, default="CFP", help='Must be CFP or OCT')
+    parser.add_argument('--modality', type=str, default="OCT", help='Must be CFP or OCT')
     parser.add_argument('--dataset_path', type=str, help='Path to root directory of PyTorch ImageFolder dataset')   
         
     # Training Hyperparameters
+    parser.add_argument('--dataset_size', type=int, help='Number of training images to train the model with.')  # CFP: 650, OCT: 914
     parser.add_argument('--total_epochs', type=int, default=10, help='Total epochs to train the model')
     parser.add_argument('--batch_size', type=int, default=64, help='Input batch size on each device')  # max batch_size with AMP {full_finetune: 64, linear_probe: 1024+}
     parser.add_argument('--learning_rate', type=float, default=0.1, help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=0, help='Weight decay')
+    parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay')
+    parser.add_argument('--global_average_pooling', type=bool, default=True, help='Use global average pooling')
     parser.add_argument('--mixed_precision', type=bool, default=True, help='Use automatic mixed precision')
     parser.add_argument('--training_strategy', type=str, default="full_finetune", help="Training strategy: full_finetune, linear_probe")
     parser.add_argument('--save_every', type=int, default=1, help='Save a snapshot every _ epochs')
 
     # Paths
-    parser.add_argument('--last_snapshot_path', type=str,
-                        default="/home/dkuo/RetFound/tasks/referable_CFP_OCT/snapshots/last.pth", 
+    parser.add_argument('--last_snapshot_path', type=str, 
+                        default="/home/dkuo/RetFound/tasks/referable_CFP_OCT/snapshots/last.pth",
                         help='Path to last training snapshot')
     parser.add_argument('--best_snapshot_path', type=str, 
                         default="/home/dkuo/RetFound/tasks/referable_CFP_OCT/snapshots/best.pth",
