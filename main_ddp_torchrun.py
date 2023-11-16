@@ -8,7 +8,6 @@
 import argparse
 from contextlib import nullcontext
 import os
-from pprint import pprint
 
 import torch
 from torch.distributed import init_process_group, destroy_process_group
@@ -109,13 +108,13 @@ class Trainer:
             loss = self.loss_fn(outputs, targets)
             preds = torch.argmax(outputs, dim=-1)  # (batch_size)
             train_acc = torch.sum(preds == targets) / len(targets)
+            print(f"[GPU{self.gpu_id}] Training loss: {loss}, Training accuracy: {train_acc}")
 
             # avg across all GPUs and send to rank 0 process
             torch.distributed.reduce(loss, op=torch.distributed.ReduceOp.AVG, dst=0)
             torch.distributed.reduce(train_acc, op=torch.distributed.ReduceOp.AVG, dst=0)
-            print(f"Training loss after reduce:[GPU{self.gpu_id}] {loss}")
-            print(f"Training acc after reduce:[GPU{self.gpu_id}] {train_acc}")
             if self.gpu_id == 0:
+                print(f"[MEAN] Training loss: {loss}, Training accuracy: {train_acc} \n")
                 wandb.log({"train_loss": loss, "train_acc": train_acc})
         
         if self.mixed_precision:
@@ -164,7 +163,8 @@ class Trainer:
             torch.distributed.reduce(value, op=torch.distributed.ReduceOp.AVG, dst=0) # avg across all GPUs and send to rank 0 process
         
         if self.gpu_id == 0:
-            pprint(f"Validation metrics: [GPU{self.gpu_id}] {metrics_dict}")
+            for metric, value in metrics_dict.items():
+                print(f"- {metric}: {value.item()}")
             if not test:
                 metrics_dict = {f"val_{metric}": value.item() for metric, value in metrics_dict.items()}
             else:  # test
@@ -185,16 +185,19 @@ class Trainer:
             targets = targets.to(self.gpu_id)
             self._train_batch(inputs, targets)
         
-        self.scheduler.step()  # update learning rate every epoch
+        if self.scheduler:
+            self.scheduler.step()  # update learning rate every epoch if using LR scheduler
 
     def train(self, max_epochs: int):
         """ Train for max_epochs """
         for epoch in range(self.epochs_run, max_epochs):
             self._train_epoch(epoch)
             self.epochs_run += 1
-            print(f"[GPU{self.gpu_id}] Epoch {epoch} | Running Validation")
+            if self.gpu_id == 0:
+                print(f"=== Epoch {epoch} | Validation Metrics ===")
             metrics_dict = self._validate()
             if self.gpu_id == 0:
+                print("======================================")
                 if epoch % self.save_every == 0:
                     self._save_snapshot(epoch, self.last_snapshot_path)
                 if self.best_val_ap < metrics_dict["val_ap"]:
@@ -360,7 +363,7 @@ def setup_model(
     return vit_model
 
 
-def setup_optimizer(model: torch.nn.Module, training_strategy: str, lr: float, weight_decay: float, total_epochs: int):
+def setup_optimizer(model: torch.nn.Module, training_strategy: str, lr: float, weight_decay: float):
     """
     Parameters
     ----------
@@ -377,8 +380,6 @@ def setup_optimizer(model: torch.nn.Module, training_strategy: str, lr: float, w
     -------
     optimizer : torch.optim.Optimizer
         Optimizer for training
-    scheduler : torch.optim.lr_scheduler
-        Learning rate scheduler
     """
     if training_strategy == "linear_probe":
         optimizer = LARS(model.head.parameters(), lr, weight_decay)
@@ -388,9 +389,24 @@ def setup_optimizer(model: torch.nn.Module, training_strategy: str, lr: float, w
         # torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     # print(optimizer)
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs)
+    return optimizer
 
-    return optimizer, scheduler
+
+def setup_lr_scheduler(optimizer: torch.optim.Optimizer, total_epochs: int):
+    """
+    Parameters
+    ----------
+    optimizer : torch.optim.Optimizer
+        Optimizer for training
+    total_epochs : int
+        Total number of epochs to train for
+    
+    Returns
+    -------
+    scheduler : torch.optim.lr_scheduler
+        Learning rate scheduler
+    """
+    return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs)
 
 
 def setup_loss_fn():
@@ -415,25 +431,24 @@ def main(args):
     mae_checkpoint_path = CFP_CHKPT_PATH if args.modality == "CFP" else OCT_CHKPT_PATH
     dataset_path = args.dataset_path if args.dataset_path else (CFP_DATASET_PATH if args.modality == "CFP" else OCT_DATASET_PATH) 
 
+    # Set up model checkpoint paths
+    last_snapshot_path = args.last_snapshot_path + "/last.pth"
+    best_snapshot_path = args.best_snapshot_path + "/best.pth"
+
     # Set up training objects
     train_dataloader, val_dataloader, test_dataloader = setup_data(dataset_path, args.batch_size, args.dataset_size)
     model = setup_model(mae_checkpoint_path, training_strategy=args.training_strategy, global_pool=args.global_average_pooling)
-    optimizer, scheduler = setup_optimizer(
-        model, 
-        training_strategy=args.training_strategy, 
-        lr=args.learning_rate, 
-        weight_decay=args.weight_decay, 
-        total_epochs=args.total_epochs
-    )
+    optimizer = setup_optimizer(model, training_strategy=args.training_strategy, lr=args.learning_rate, weight_decay=args.weight_decay)
+    scheduler = None  # setup_lr_scheduler(optimizer, args.total_epochs)
     loss_fn = setup_loss_fn()
 
-    #  Set up W&B logging 
+    # Set up W&B logging 
     gpu_id = int(os.environ["LOCAL_RANK"])
     if gpu_id == 0:  # only log on main process
         wandb.init(
             project="retfound_referable_cfp_oct",
             config=args,
-            resume=True,  # continue logging from previous run if did not successfully finish
+            resume=args.resume_training,  # continue logging from previous run
         )
 
     # Set up trainer
@@ -447,17 +462,30 @@ def main(args):
         loss_fn=loss_fn,
         mixed_precision=args.mixed_precision,
         save_every=args.save_every,
-        last_snapshot_path=args.last_snapshot_path,
-        best_snapshot_path=args.best_snapshot_path,
+        last_snapshot_path=last_snapshot_path,
+        best_snapshot_path=best_snapshot_path,
         test_snapshot_path=args.final_test_snapshot_path,
     )
     
     # Test if given a final test snapshot
     if args.final_test_snapshot_path:
         trainer.test()
-    # Train
+    
+    # Otherwise, train model
     else: 
-        trainer.train(args.total_epochs)
+        try:
+            trainer.train(args.total_epochs)
+        except Exception as e:
+            print(f"An exception occurred during training: \n{e}")
+        else:  
+            # If training finishes successfully, delete the last.pth model snapshot using gpu 0
+            # and rename best.pth to [wandb_run_name].pth
+            if gpu_id == 0:
+                print(f"\nTraining completed successfully! Deleting last.pth and saving best.pth as {wandb.run.name}.pth\n")
+                if os.path.exists(last_snapshot_path): 
+                    os.remove(last_snapshot_path)
+                if os.path.exists(best_snapshot_path):
+                    os.rename(best_snapshot_path, f"{args.best_snapshot_path}/{wandb.run.name}.pth")
 
     # Clean up
     wandb.finish()
@@ -472,27 +500,31 @@ if __name__ == "__main__":
     parser.add_argument('--dataset_path', type=str, help='Path to root directory of PyTorch ImageFolder dataset')   
         
     # Training Hyperparameters
-    parser.add_argument('--dataset_size', type=int, help='Number of training images to train the model with.')  # CFP: 650, OCT: 914
-    parser.add_argument('--total_epochs', type=int, default=10, help='Total epochs to train the model')
+    parser.add_argument('--dataset_size', type=int, default=100, help='Number of training images to train the model with.')  # CFP: 650, OCT: 914
+    parser.add_argument('--total_epochs', type=int, default=50, help='Total epochs to train the model')  #  10 epochs with full dataset
     parser.add_argument('--batch_size', type=int, default=64, help='Input batch size on each device')  # max batch_size with AMP {full_finetune: 64, linear_probe: 1024+}
     parser.add_argument('--learning_rate', type=float, default=0.1, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay')
-    parser.add_argument('--global_average_pooling', type=bool, default=True, help='Use global average pooling')
+    parser.add_argument('--global_average_pooling', type=bool, default=False, help='Use global average pooling')
     parser.add_argument('--mixed_precision', type=bool, default=True, help='Use automatic mixed precision')
     parser.add_argument('--training_strategy', type=str, default="full_finetune", help="Training strategy: full_finetune, linear_probe")
     parser.add_argument('--save_every', type=int, default=1, help='Save a snapshot every _ epochs')
 
-    # Paths
+    # Resume training & model snapshot paths
+    parser.add_argument('--resume_training', type=bool, default=True, help='Resume training from last snapshot')
     parser.add_argument('--last_snapshot_path', type=str, 
-                        default="/home/dkuo/RetFound/tasks/referable_CFP_OCT/snapshots/last.pth",
-                        help='Path to last training snapshot')
+                        default="/home/dkuo/RetFound/tasks/referable_CFP_OCT/snapshots",
+                        help='Path to directory for saving last training snapshot (will be saved as last.pth)')
     parser.add_argument('--best_snapshot_path', type=str, 
-                        default="/home/dkuo/RetFound/tasks/referable_CFP_OCT/snapshots/best.pth",
-                        help='Path to best snapshot so far')
+                        default="/home/dkuo/RetFound/tasks/referable_CFP_OCT/snapshots",
+                        help='Path to directory for saving best snapshot so far (will be saved as best.pth)')
+    
+    # Evaluate on final test set
     parser.add_argument('--final_test_snapshot_path', type=str, help='Evaluate snapshot at provided path on final test set.')
 
     args = parser.parse_args()
     main(args)
+
 
 # Run on all of 3 visible GPUs on 1 machine: 
 # > CUDA_VISIBLE_DEVICES=0,1,2 torchrun --standalone --nproc_per_node=gpu main_ddp_torchrun.py [args]
