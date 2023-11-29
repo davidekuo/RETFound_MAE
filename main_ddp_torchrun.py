@@ -20,6 +20,7 @@ import torchmetrics.classification as metrics
 from torchvision import datasets, transforms
 # import torchvision.transforms.v2 as transforms
 
+import timm
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.models.layers import trunc_normal_
 
@@ -86,7 +87,7 @@ class Trainer:
         """ Load snapshot of model """
         loc = f"cuda:{self.gpu_id}"
         snapshot = torch.load(snapshot_path, map_location=loc)
-        self.model.load_state_dict(snapshot["MODEL_STATE"])
+        self.model.module.load_state_dict(snapshot["MODEL_STATE"])  # alternatively, use self.model.load_state_dict(...) but save self.model.state_dict() in _save_snapshot()
         self.optimizer.load_state_dict(snapshot["OPTIMIZER_STATE"])
         self.epochs_run = snapshot["EPOCHS_RUN"]
         self.best_val_ap = snapshot["BEST_VAL_AP"]
@@ -226,7 +227,7 @@ def setup_ddp():
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
 
-def default_data_transform():
+def _default_data_transform():
     """ Return default data transforms (based on ImageNet dataset) - for val and test datasets """
     return transforms.Compose([
         transforms.Resize(RETFOUND_EXPECTED_IMAGE_SIZE, 
@@ -246,7 +247,7 @@ def default_data_transform():
     # ])
 
 
-def augment_data_transform(augment: str):
+def _augment_data_transform(augment: str):
     """
     Parameters
     ----------
@@ -297,7 +298,7 @@ def augment_data_transform(augment: str):
     # ])
 
 
-def cutmixup_collate_fn(batch):
+def _cutmixup_collate_fn(batch):
     """ Returns DataLoader collate function with CutMix and MixUp at random - for training dataloader only """
     cutmix = transforms.CutMix(num_classes=2)
     mixup = transforms.MixUp(num_classes=2)
@@ -305,7 +306,7 @@ def cutmixup_collate_fn(batch):
     return cutmix_or_mixup(*default_collate(batch))
 
 
-def setup_dataloader(dataset: Dataset, batch_size: int, collate_fn=None):
+def _setup_dataloader(dataset: Dataset, batch_size: int, collate_fn=None):
     """
     Parameters
     ----------
@@ -343,7 +344,7 @@ def setup_data(dataset_path: str, batch_size: int, dataset_size: int = None, aug
     dataset_size : int, optional
         Number of images to sample from the training set. Use all images if not specified.
     augment : str, optional
-        Data augmentation strategy: "none", "trivial_augment", "randaugment", "augmix"; by default "none"
+        Data augmentation strategy: "none", "trivialaugment", "randaugment", "autoaugment", "augmix", "deit3"; by default "none"
     cutmixup : bool, optional
         Whether to use CutMix/MixUp data augmentation, by default False
     
@@ -353,42 +354,42 @@ def setup_data(dataset_path: str, batch_size: int, dataset_size: int = None, aug
         Dataloaders for training, validation, and test sets
     """
     # Set up data augmentations
-    train_transform = default_data_transform() if augment == "none" else augment_data_transform(augment)
-    train_collate_fn = cutmixup_collate_fn if cutmixup else None
+    train_transform = _default_data_transform() if augment == "none" else _augment_data_transform(augment)
+    train_collate_fn = _cutmixup_collate_fn if cutmixup else None
 
     # Set up datasets
     train_dataset = datasets.ImageFolder(dataset_path + "/train", transform=train_transform)
-    val_dataset = datasets.ImageFolder(dataset_path + "/val", transform=default_data_transform())
-    test_dataset = datasets.ImageFolder(dataset_path + "/test", transform=default_data_transform())
+    val_dataset = datasets.ImageFolder(dataset_path + "/val", transform=_default_data_transform())
+    test_dataset = datasets.ImageFolder(dataset_path + "/test", transform=_default_data_transform())
 
     # If specified, take a random subset of the training dataset of size 'dataset_size' 
     if dataset_size:
         train_dataset = torch.utils.data.Subset(train_dataset, torch.randperm(len(train_dataset))[:dataset_size])
     
     # Set up and return dataloaders
-    train_dataloader = setup_dataloader(train_dataset, args.batch_size, train_collate_fn)
-    val_dataloader = setup_dataloader(val_dataset, args.batch_size)
-    test_dataloader = setup_dataloader(test_dataset, args.batch_size)
+    train_dataloader = _setup_dataloader(train_dataset, args.batch_size, train_collate_fn)
+    val_dataloader = _setup_dataloader(val_dataset, args.batch_size)
+    test_dataloader = _setup_dataloader(test_dataset, args.batch_size)
 
     return train_dataloader, val_dataloader, test_dataloader
 
 
 def setup_model(
-        mae_checkpoint_path: str, 
+        model_arch: str, 
+        modality: str, 
         training_strategy: str,
-        arch: str = 'vit_large_patch16', 
         num_classes: int = 2, 
         global_pool: bool = False,
     ):
     """
     Parameters
     ----------
-    mae_checkpoint_path : str
-        Path to checkpoint of MAE model
+    model_arch : str
+        Model architecture: resnet50, vit_large, retfound
+    modality : str
+        Modality: CFP, OCT
     training_strategy : str
         Training strategy: full_finetune, linear_probe
-    arch : str, optional
-        Architecture of ViT model, by default 'vit_large_patch16'
     num_classes : int, optional
         Number of classes, by default 2
     global_pool : bool, optional
@@ -396,54 +397,59 @@ def setup_model(
     
     Returns
     -------
-    vit_model : torch.nn.Module
-        ViT model
+    model : torch.nn.Module
+        Model to train
     """
+    assert model_arch in ["resnet50", "vit_large", "retfound"], "Model architecture must be resnet50, vit_large, or retfound"
     assert args.training_strategy in ["full_finetune", "linear_probe"], "Training strategy must be full_finetune, or linear_probe"
 
-    # instantiate model
-    vit_model = models_vit.__dict__[arch](
-        num_classes=num_classes,
-        global_pool=global_pool,
-    )
+    if model_arch == "resnet50":
+        print("Setting up timm model: resnet50.a1_in1k")
+        model = timm.create_model('resnet50.a1_in1k', pretrained=True, num_classes=num_classes)
     
-    # load mae checkpoint
-    print(f"Loading model from {mae_checkpoint_path}")
-    mae_checkpoint = torch.load(mae_checkpoint_path, map_location='cpu')
-    mae_checkpoint_model = mae_checkpoint["model"]
-    state_dict = vit_model.state_dict()
+    elif model_arch == "vit_large":
+        print("Setting up timm model: vit_large_patch16_224.augreg_in21k_ft_in1k")
+        model = timm.create_model('vit_large_patch16_224.augreg_in21k_ft_in1k', pretrained=True, num_classes=num_classes)
     
-    # adapt mae model to vit model
-    for k in ["head.weight", "head.bias"]:
-        if k in mae_checkpoint_model and mae_checkpoint_model[k].shape != state_dict[k].shape:
-            print(f"Removing key {k} from checkpoint due to shape mismatch")
-            del mae_checkpoint_model[k]
-
-    # interpolate position embedding following DeiT
-    interpolate_pos_embed(vit_model, mae_checkpoint_model)
+    else:  # model_arch == "retfound" 
+        print("Setting up RetFound model")
+        model = models_vit.__dict__['vit_large_patch16'](
+            num_classes=num_classes,
+            global_pool=global_pool,
+        )
+        # load mae checkpoint
+        mae_checkpoint_path = CFP_CHKPT_PATH if modality == "CFP" else OCT_CHKPT_PATH
+        print(f"Loading model from {mae_checkpoint_path}")
+        mae_checkpoint = torch.load(mae_checkpoint_path, map_location='cpu')
+        mae_checkpoint_model = mae_checkpoint["model"]
+        state_dict = model.state_dict()
+        # adapt mae model to vit model
+        for k in ["head.weight", "head.bias"]:
+            if k in mae_checkpoint_model and mae_checkpoint_model[k].shape != state_dict[k].shape:
+                print(f"Removing key {k} from checkpoint due to shape mismatch")
+                del mae_checkpoint_model[k]
+        # interpolate position embedding following DeiT
+        interpolate_pos_embed(model, mae_checkpoint_model)
+        # load mae model state
+        msg = model.load_state_dict(mae_checkpoint['model'], strict=False)
+        # print(msg)
+        if global_pool:
+            assert set(msg.missing_keys) == {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}
+        else:
+            assert set(msg.missing_keys) == {"head.weight", "head.bias"}
+        # manually initialize head fc layer following MoCo v3
+        trunc_normal_(model.head.weight, std=.02)
+        # set up linear probing if needed
+        if training_strategy == "linear_probe":
+            # hack for linear probe: revise model head with batchnorm
+            model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), model.head)
+            # freeze all parameters but the head
+            for name, param in model.named_parameters():
+                param.requires_grad = False
+            for name, param in model.head.named_parameters():
+                param.requires_grad = True
     
-    msg = vit_model.load_state_dict(mae_checkpoint['model'], strict=False)
-    # print(msg)
-
-    if global_pool:
-        assert set(msg.missing_keys) == {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}
-    else:
-        assert set(msg.missing_keys) == {"head.weight", "head.bias"}
-
-    # manually initialize head fc layer following MoCo v3
-    trunc_normal_(vit_model.head.weight, std=.02)
-
-    if training_strategy == "linear_probe":
-        # hack for linear probe: revise model head with batchnorm
-        vit_model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(vit_model.head.in_features, affine=False, eps=1e-6), vit_model.head)
-    
-        # freeze all parameters but the head
-        for name, param in vit_model.named_parameters():
-            param.requires_grad = False
-        for name, param in vit_model.head.named_parameters():
-            param.requires_grad = True
-    
-    return vit_model
+    return model
 
 
 def setup_optimizer(
@@ -531,9 +537,8 @@ def main(args):
     setup_ddp()
     torch.manual_seed(0)
 
-    # Set up correct pretrained model and dataset paths for modality
+    # Set up correct dataset paths for modality
     assert args.modality in ["CFP", "OCT"], "Modality must be CFP or OCT"
-    mae_checkpoint_path = CFP_CHKPT_PATH if args.modality == "CFP" else OCT_CHKPT_PATH
     dataset_path = args.dataset_path if args.dataset_path else (CFP_DATASET_PATH if args.modality == "CFP" else OCT_DATASET_PATH) 
 
     # Set up model checkpoint paths
@@ -542,7 +547,7 @@ def main(args):
 
     # Set up training objects
     train_dataloader, val_dataloader, test_dataloader = setup_data(dataset_path, args.batch_size, args.dataset_size, args.augment, args.cutmixup)
-    model = setup_model(mae_checkpoint_path, training_strategy=args.training_strategy, global_pool=args.global_average_pooling)
+    model = setup_model(model_arch=args.model_arch, modality=args.modality, training_strategy=args.training_strategy, global_pool=args.global_average_pooling)
     optimizer = setup_optimizer(model, algo=args.optimizer, training_strategy=args.training_strategy, lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = setup_lr_scheduler(optimizer, args.total_epochs)
     loss_fn = setup_loss_fn()
@@ -607,20 +612,21 @@ if __name__ == "__main__":
         
     # Data Hyperparameters
     parser.add_argument('--dataset_size', type=int, help='Number of training images to train the model with.')  # CFP: 650, OCT: 914
-    parser.add_argument('--augment', type=str, default="trivialaugment", help='Data augmentation strategy: none, trivialaugment, randaugment, autoaugment, augmix, deit3') 
-    parser.add_argument('--cutmixup', type=bool, default=False, help='Whether to use CutMix/MixUp data augmentation')
+    parser.add_argument('--augment', type=str, default="none", help='Data augmentation strategy: none, trivialaugment, randaugment, autoaugment, augmix, deit3') 
+    parser.add_argument('--cutmixup', type=bool, default=False, help='Whether to use CutMix/MixUp data augmentation')  # TODO: debug
     
     # Training Hyperparameters
+    parser.add_argument('--model_arch', type=str, default="retfound", help='Model architecture: resnet50, vit_large, retfound')
     parser.add_argument('--total_epochs', type=int, default=50, help='Total epochs to train the model')  # 10 epochs with full dataset
     parser.add_argument('--batch_size', type=int, default=64, help='Input batch size on each device')  # max batch_size with AMP {full_finetune: 64, linear_probe: 1024+}
     
     parser.add_argument('--optimizer', type=str, default="lars", help='Optimizer: adamw, lars')
     parser.add_argument('--lr_scheduler', type=str, help='Learning rate scheduler: none, cosine_linear_warmup')  
-    parser.add_argument('--training_strategy', type=str, default="full_finetune", help="Training strategy: full_finetune, linear_probe, lora")
+    parser.add_argument('--training_strategy', type=str, default="full_finetune", help="Training strategy: full_finetune, linear_probe, lora")  # TODO: fix linear_probe, add lora
     parser.add_argument('--learning_rate', type=float, default=0.1, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay')
     
-    parser.add_argument('--global_average_pooling', type=bool, default=False, help='Use global average pooling')
+    parser.add_argument('--global_average_pooling', type=bool, default=False, help='Use global average pooling')  # TODO: debug
     parser.add_argument('--mixed_precision', type=bool, default=True, help='Use automatic mixed precision')
     parser.add_argument('--save_every', type=int, default=1, help='Save a snapshot every _ epochs')
 
