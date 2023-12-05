@@ -18,9 +18,10 @@ from torch.utils.data import Dataset, DataLoader, default_collate
 from torch.utils.data.distributed import DistributedSampler
 import torchmetrics.classification as metrics
 from torchvision import datasets, transforms
-# import torchvision.transforms.v2 as transforms
+# import torchvision.transforms.v2 as transforms_v2
 
 import timm
+from timm.optim import Lamb
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.models.layers import trunc_normal_
 
@@ -271,7 +272,7 @@ def _augment_data_transform(augment: str):
 
     augmentations = {
         "trivialaugment": transforms.TrivialAugmentWide(),
-        "randaugment": transforms.RandAugment(),
+        "randaugment": transforms.RandAugment(num_ops=4),
         "autoaugment": transforms.AutoAugment(),
         "augmix": transforms.AugMix(),
         "deit3": deit3_transforms,
@@ -300,10 +301,10 @@ def _augment_data_transform(augment: str):
 
 def _cutmixup_collate_fn(batch):
     """ Returns DataLoader collate function with CutMix and MixUp at random - for training dataloader only """
-    cutmix = transforms.CutMix(num_classes=2)
-    mixup = transforms.MixUp(num_classes=2)
-    cutmix_or_mixup = transforms.RandomChoice([cutmix, mixup])
-    return cutmix_or_mixup(*default_collate(batch))
+    # cutmix = transforms_v2.CutMix(num_classes=2)
+    # mixup = transforms_v2.MixUp(num_classes=2)
+    # cutmix_or_mixup = transforms_v2.RandomChoice([cutmix, mixup])
+    # return cutmix_or_mixup(*default_collate(batch))
 
 
 def _setup_dataloader(dataset: Dataset, batch_size: int, collate_fn=None):
@@ -478,9 +479,13 @@ def setup_optimizer(
     optimizer : torch.optim.Optimizer
         Optimizer for training
     """
+
+
     optimization_algorithms = {
+        "adam": torch.optim.Adam,
         "adamw": torch.optim.AdamW,
         "lars": LARS,
+        "lamb": Lamb,
     }
     assert algo in optimization_algorithms, f"Optimizer must be one of {list(optimization_algorithms.keys())}"
     optim_algo = optimization_algorithms[algo]
@@ -607,23 +612,23 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     # Task parameters
-    parser.add_argument('--modality', type=str, default="OCT", help='Must be CFP or OCT')
+    parser.add_argument('--modality', type=str, default="CFP", help='Must be CFP or OCT')
     parser.add_argument('--dataset_path', type=str, help='Path to root directory of PyTorch ImageFolder dataset')   
         
     # Data Hyperparameters
     parser.add_argument('--dataset_size', type=int, help='Number of training images to train the model with.')  # CFP: 650, OCT: 914
-    parser.add_argument('--augment', type=str, default="none", help='Data augmentation strategy: none, trivialaugment, randaugment, autoaugment, augmix, deit3') 
+    parser.add_argument('--augment', type=str, default="randaugment", help='Data augmentation strategy: none, trivialaugment, randaugment, autoaugment, augmix, deit3') 
     parser.add_argument('--cutmixup', type=bool, default=False, help='Whether to use CutMix/MixUp data augmentation')  # TODO: debug
     
     # Training Hyperparameters
     parser.add_argument('--model_arch', type=str, default="retfound", help='Model architecture: resnet50, vit_large, retfound')
-    parser.add_argument('--total_epochs', type=int, default=50, help='Total epochs to train the model')  # 10 epochs with full dataset
+    parser.add_argument('--training_strategy', type=str, default="full_finetune", help="Training strategy: full_finetune, linear_probe, lora")  # TODO: fix linear_probe, add lora
+    parser.add_argument('--total_epochs', type=int, default=100, help='Total epochs to train the model')  # 10 epochs with full dataset
     parser.add_argument('--batch_size', type=int, default=64, help='Input batch size on each device')  # max batch_size with AMP {full_finetune: 64, linear_probe: 1024+}
     
-    parser.add_argument('--optimizer', type=str, default="lars", help='Optimizer: adamw, lars')
-    parser.add_argument('--lr_scheduler', type=str, help='Learning rate scheduler: none, cosine_linear_warmup')  
-    parser.add_argument('--training_strategy', type=str, default="full_finetune", help="Training strategy: full_finetune, linear_probe, lora")  # TODO: fix linear_probe, add lora
+    parser.add_argument('--optimizer', type=str, default="lars", help='Optimizer: adam, adamw, lars, lamb')
     parser.add_argument('--learning_rate', type=float, default=0.1, help='Learning rate')
+    parser.add_argument('--lr_scheduler', type=str, help='Learning rate scheduler: none, cosine_linear_warmup')  
     parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay')
     
     parser.add_argument('--global_average_pooling', type=bool, default=False, help='Use global average pooling')  # TODO: debug
