@@ -47,6 +47,7 @@ class Trainer:
             train_dataloader: DataLoader,
             val_dataloader: DataLoader,
             test_dataloader: DataLoader,
+            grad_accum_steps: int,
             optimizer: torch.optim.Optimizer,
             scheduler: torch.optim.lr_scheduler,
             loss_fn: torch.nn.Module,
@@ -60,6 +61,7 @@ class Trainer:
         self.gpu_id = int(os.environ["LOCAL_RANK"])
         self.model = model.to(self.gpu_id)
         self.model = DDP(self.model, device_ids=[self.gpu_id])
+        self.grad_accum_steps = grad_accum_steps
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.loss_fn = loss_fn
@@ -79,7 +81,7 @@ class Trainer:
         self.last_snapshot_path = last_snapshot_path
         self.best_snapshot_path = best_snapshot_path
         self.test_snapshot_path = test_snapshot_path
-        self.best_val_ap = 0.0
+        self.best_val_acc = 0.0
         if os.path.exists(last_snapshot_path):
             print("Loading snapshot")
             self._load_snapshot(last_snapshot_path)
@@ -91,7 +93,7 @@ class Trainer:
         self.model.module.load_state_dict(snapshot["MODEL_STATE"])  # alternatively, use self.model.load_state_dict(...) but save self.model.state_dict() in _save_snapshot()
         self.optimizer.load_state_dict(snapshot["OPTIMIZER_STATE"])
         self.epochs_run = snapshot["EPOCHS_RUN"]
-        self.best_val_ap = snapshot["BEST_VAL_AP"]
+        self.best_val_acc = snapshot["BEST_VAL_ACC"]
         print(f"Successfully loaded snapshot from Epoch {self.epochs_run}")
     
     def _save_snapshot(self, epoch: int, snapshot_path: str):
@@ -100,41 +102,41 @@ class Trainer:
             "MODEL_STATE": self.model.module.state_dict(),  # actual model is module wrapped by DDP
             "OPTIMIZER_STATE": self.optimizer.state_dict(),
             "EPOCHS_RUN": epoch,
-            "BEST_VAL_AP": self.best_val_ap,
+            "BEST_VAL_ACC": self.best_val_acc,
         }
         torch.save(snapshot, snapshot_path)
         print(f"Epoch {epoch} | Training snapshot saved at {snapshot_path}")
     
-    def _train_batch(self, inputs: torch.Tensor, targets: torch.Tensor):
+    def _train_batch(self, index: int, inputs: torch.Tensor, targets: torch.Tensor):
         """ Train on one batch """
         self.model.train()
         self.optimizer.zero_grad()
+        take_gradient_step = ((index + 1) % self.grad_accum_steps == 0) or ((index + 1) == len(self.train_dataloader))
+        # Take gradient step only every self.grad_accum_steps steps or at the end of the epoch
         
         with torch.autocast(device_type='cuda', dtype=torch.float16) if self.mixed_precision else nullcontext():
-            outputs = self.model(inputs)  # (batch_size, num_classes)
-            loss = self.loss_fn(outputs, targets)
-            preds = torch.argmax(outputs, dim=-1)  # (batch_size)
-            try:
+            with self.model.no_sync() if not take_gradient_step else nullcontext():
+                outputs = self.model(inputs)  # (batch_size, num_classes)
+                loss = self.loss_fn(outputs, targets)
+                preds = torch.argmax(outputs, dim=-1)  # (batch_size)
                 train_acc = torch.sum(preds == targets) / len(targets)
-            except Exception as e:
-                print(f"Exception: {e}")  #  most likely due to CutMix/MixUp
-                train_acc = torch.sum(preds == torch.argmax(outputs, dim=-1)) / len(preds)
-            print(f"[GPU{self.gpu_id}] Training loss: {loss}, Training accuracy: {train_acc}")
+                print(f"[GPU{self.gpu_id}] Training loss: {loss}, Training accuracy: {train_acc}")
 
-            # avg across all GPUs and send to rank 0 process
-            torch.distributed.reduce(loss, op=torch.distributed.ReduceOp.AVG, dst=0)
-            torch.distributed.reduce(train_acc, op=torch.distributed.ReduceOp.AVG, dst=0)
-            if self.gpu_id == 0:
-                print(f"[MEAN] Training loss: {loss}, Training accuracy: {train_acc} \n")
-                wandb.log({"train_loss": loss, "train_acc": train_acc})
+                # avg across all GPUs and send to rank 0 process
+                torch.distributed.reduce(loss, op=torch.distributed.ReduceOp.AVG, dst=0)
+                torch.distributed.reduce(train_acc, op=torch.distributed.ReduceOp.AVG, dst=0)
+                if self.gpu_id == 0:
+                    print(f"[MEAN] Training loss: {loss}, Training accuracy: {train_acc} \n")
+                    wandb.log({"train_loss": loss, "train_acc": train_acc})
+                
+                self.scaler.scale(loss).backward() if self.mixed_precision else loss.backward()
         
-        if self.mixed_precision:
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-        else:
-            loss.backward()
-            self.optimizer.step()
+        if take_gradient_step:
+            if self.mixed_precision:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
     
     def _validate(self, test: bool = False):
         """ Validate current model on validation or final test dataset"""
@@ -190,11 +192,11 @@ class Trainer:
         print(f"\n[GPU{self.gpu_id}] Epoch {epoch} | Batch size {batch_size} | Steps: {len(self.train_dataloader)}")
         self.train_dataloader.sampler.set_epoch(epoch)
         
-        for batch in self.train_dataloader:
+        for index, batch in enumerate(self.train_dataloader):
             inputs, targets = batch
             inputs = inputs.to(self.gpu_id)
             targets = targets.to(self.gpu_id)
-            self._train_batch(inputs, targets)
+            self._train_batch(index, inputs, targets)
         
         if self.scheduler:
             self.scheduler.step()  # update learning rate every epoch if using LR scheduler (alternatively, update every step)
@@ -211,7 +213,7 @@ class Trainer:
                 print("==================================== \n")
                 if epoch % self.save_every == 0:
                     self._save_snapshot(epoch, self.last_snapshot_path)
-                if self.best_val_ap < metrics_dict["val_ap"]:
+                if self.best_val_acc < metrics_dict["val_accuracy"]:
                     self._save_snapshot(epoch, self.best_snapshot_path)
     
     def test(self):
@@ -219,7 +221,7 @@ class Trainer:
         self._load_snapshot(self.test_snapshot_path)
         metrics_dict = self._validate(test=True)
         if self.gpu_id == 0:
-            print(f"Test Set Performance: \n{metrics_dict}")
+            print(f"Test Set Performance for {self.test_snapshot_path}: \n{metrics_dict}")
 
 
 def setup_ddp():
@@ -532,8 +534,11 @@ def setup_loss_fn():
     loss_fn : torch.nn.Module
         Loss function for training
     """
+    # referable_CFP_OCT
     # CFP training set has 548 normal and 102 referable (0.19)
     # OCT training set has 782 normal and 132 referable (0.17)
+    # peds_optos
+    # CFP training set has 148 abnormal and 68 normal (0.43) -> class_weights = [1.0, 2.3]
     class_weights = torch.tensor([1.0, 5.0]).cuda()  # [normal, referable]
     return torch.nn.CrossEntropyLoss(weight=class_weights)  
 
@@ -563,7 +568,7 @@ def main(args):
         wandb.init(
             project="retfound_referable_cfp_oct",
             config=args,
-            resume=True,  # continue logging from previous run if did not finish
+            resume=False,  # continue logging from previous run if did not finish
         )
 
     # Set up trainer
@@ -572,6 +577,7 @@ def main(args):
         train_dataloader=train_dataloader,
         val_dataloader=val_dataloader,
         test_dataloader=test_dataloader,
+        grad_accum_steps=args.grad_accum_steps,
         optimizer=optimizer,
         scheduler=scheduler,
         loss_fn=loss_fn,
@@ -623,8 +629,9 @@ if __name__ == "__main__":
     # Training Hyperparameters
     parser.add_argument('--model_arch', type=str, default="retfound", help='Model architecture: resnet50, vit_large, retfound')
     parser.add_argument('--training_strategy', type=str, default="full_finetune", help="Training strategy: full_finetune, linear_probe, lora")  # TODO: fix linear_probe, add lora
-    parser.add_argument('--total_epochs', type=int, default=100, help='Total epochs to train the model')  # 10 epochs with full dataset
+    parser.add_argument('--total_epochs', type=int, default=20, help='Total epochs to train the model')  # 10 epochs with full dataset
     parser.add_argument('--batch_size', type=int, default=64, help='Input batch size on each device')  # max batch_size with AMP {full_finetune: 64, linear_probe: 1024+}
+    parser.add_argument('--grad_accum_steps', type=int, default=1, help='Number of gradient accumulation steps before performing optimizer step. Effective batch size becomes batch_size * gradient_accumulation_steps * num_gpus')
     
     parser.add_argument('--optimizer', type=str, default="lars", help='Optimizer: adam, adamw, lars, lamb')
     parser.add_argument('--learning_rate', type=float, default=0.1, help='Learning rate')
@@ -650,5 +657,5 @@ if __name__ == "__main__":
     main(args)
 
 
-# Run on all of 3 visible GPUs on 1 machine: 
+# With GPUs 0,1,2 visible on 1 (standalone) machine, using all available GPUs, run main_ddp_torchrun.py [args] 
 # > CUDA_VISIBLE_DEVICES=0,1,2 torchrun --standalone --nproc_per_node=gpu main_ddp_torchrun.py [args]
