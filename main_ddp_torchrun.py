@@ -56,6 +56,7 @@ class Trainer:
             best_snapshot_path: str,
             test_snapshot_path: str = None,
             mixed_precision: bool = False,
+            evaluate_on_final_test_set: bool = False,
     ) -> None:
         # model, optimizer, loss
         self.gpu_id = int(os.environ["LOCAL_RANK"])
@@ -85,6 +86,9 @@ class Trainer:
         if os.path.exists(last_snapshot_path):
             print("Loading snapshot")
             self._load_snapshot(last_snapshot_path)
+        
+        # evaluate on final test set
+        self.evaluate_on_final_test_set = evaluate_on_final_test_set
 
     def _load_snapshot(self, snapshot_path: str) -> None:
         """ Load snapshot of model """
@@ -94,7 +98,7 @@ class Trainer:
         self.optimizer.load_state_dict(snapshot["OPTIMIZER_STATE"])
         self.epochs_run = snapshot["EPOCHS_RUN"]
         self.best_val_acc = snapshot["BEST_VAL_ACC"]
-        print(f"Successfully loaded snapshot from Epoch {self.epochs_run}")
+        print(f"Successfully loaded snapshot from Epoch {self.epochs_run}. Best validation accuracy so far: {self.best_val_acc}")
     
     def _save_snapshot(self, epoch: int, snapshot_path: str):
         """ Save snapshot of current model """
@@ -215,6 +219,12 @@ class Trainer:
                     self._save_snapshot(epoch, self.last_snapshot_path)
                 if self.best_val_acc < metrics_dict["val_accuracy"]:
                     self._save_snapshot(epoch, self.best_snapshot_path)
+                    self.best_val_acc = metrics_dict["val_accuracy"]
+        
+        if self.evaluate_on_final_test_set:
+            print("Finished training for {max_epochs} epochs. Evaluating best model snapshot on final test set")
+            self.test_snapshot_path = self.best_snapshot_path
+            self.test()
     
     def test(self):
         """ Test on final test set """
@@ -535,17 +545,17 @@ def setup_loss_fn():
         Loss function for training
     """
     # referable_CFP_OCT
-    # CFP training set has 548 normal and 102 referable (0.19)
-    # OCT training set has 782 normal and 132 referable (0.17)
+    # CFP training set has 548 normal and 102 referable (0.19) -> class_weights = [1.0, 5.0]
+    # OCT training set has 782 normal and 132 referable (0.17) -> class_weights = [1.0, 5.0]
     # peds_optos
     # CFP training set has 148 abnormal and 68 normal (0.43) -> class_weights = [1.0, 2.3]
-    class_weights = torch.tensor([1.0, 5.0]).cuda()  # [normal, referable]
+    class_weights = torch.tensor([1.0, 2.3]).cuda()  # [normal, referable]
     return torch.nn.CrossEntropyLoss(weight=class_weights)  
 
 
 def main(args):
     setup_ddp()
-    torch.manual_seed(0)
+    torch.manual_seed(args.seed)
 
     # Set up correct dataset paths for modality
     assert args.modality in ["CFP", "OCT"], "Modality must be CFP or OCT"
@@ -566,9 +576,9 @@ def main(args):
     gpu_id = int(os.environ["LOCAL_RANK"])
     if gpu_id == 0:  # only log on main process
         wandb.init(
-            project="retfound_referable_cfp_oct",
+            project=args.wandb_proj_name,
             config=args,
-            resume=False,  # continue logging from previous run if did not finish
+            resume=True,  # continue logging from previous run if did not finish
         )
 
     # Set up trainer
@@ -586,6 +596,7 @@ def main(args):
         last_snapshot_path=last_snapshot_path,
         best_snapshot_path=best_snapshot_path,
         test_snapshot_path=args.final_test_snapshot_path,
+        evaluate_on_final_test_set=args.evaluate_on_final_test_set,
     )
     
     # Test if given a final test snapshot
@@ -617,9 +628,13 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
+    # Random seed
+    parser.add_argument('--seed', type=int, default=0, help='Random seed')
+
     # Task parameters
-    parser.add_argument('--modality', type=str, default="CFP", help='Must be CFP or OCT')
-    parser.add_argument('--dataset_path', type=str, help='Path to root directory of PyTorch ImageFolder dataset')   
+    parser.add_argument('--modality', type=str, default="OCT", help='Must be CFP or OCT')
+    parser.add_argument('--dataset_path', type=str, help='Path to root directory of PyTorch ImageFolder dataset')
+    parser.add_argument('--wandb_proj_name', default="retfound_referable_cfp_oct", type=str, help='Name of W&B project to log to')   
         
     # Data Hyperparameters
     parser.add_argument('--dataset_size', type=int, help='Number of training images to train the model with.')  # CFP: 650, OCT: 914
@@ -634,7 +649,7 @@ if __name__ == "__main__":
     parser.add_argument('--grad_accum_steps', type=int, default=1, help='Number of gradient accumulation steps before performing optimizer step. Effective batch size becomes batch_size * gradient_accumulation_steps * num_gpus')
     
     parser.add_argument('--optimizer', type=str, default="lars", help='Optimizer: adam, adamw, lars, lamb')
-    parser.add_argument('--learning_rate', type=float, default=0.1, help='Learning rate')
+    parser.add_argument('--learning_rate', type=float, default=0.25, help='Learning rate')
     parser.add_argument('--lr_scheduler', type=str, help='Learning rate scheduler: none, cosine_linear_warmup')  
     parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay')
     
@@ -651,6 +666,7 @@ if __name__ == "__main__":
                         help='Path to directory for saving best snapshot so far (will be saved as best.pth)')
     
     # Evaluate on final test set
+    parser.add_argument('--evaluate_on_final_test_set', action='store_true', help='Evaluate best model snapshot on final test set at the end of training')
     parser.add_argument('--final_test_snapshot_path', type=str, help='Evaluate snapshot at provided path on final test set.')
 
     args = parser.parse_args()
