@@ -14,7 +14,7 @@ import torch
 from torch.distributed import init_process_group, destroy_process_group
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import Dataset, DataLoader, default_collate
+from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import torchmetrics.classification as metrics
 from torchvision import datasets, transforms
@@ -82,7 +82,7 @@ class Trainer:
         self.last_snapshot_path = last_snapshot_path
         self.best_snapshot_path = best_snapshot_path
         self.test_snapshot_path = test_snapshot_path
-        self.best_val_acc = 0.0
+        self.best_val_f1 = 0.0  # given imbalanced dataset, also consider average precision
         if os.path.exists(last_snapshot_path):
             print("Loading snapshot")
             self._load_snapshot(last_snapshot_path)
@@ -146,13 +146,13 @@ class Trainer:
         """ Validate current model on validation or final test dataset"""
         metrics_dict = {"avg_loss": torch.tensor([0.0]).to(self.gpu_id)}
         torchmetrics_dict = torch.nn.ModuleDict({
-            "auroc": metrics.AUROC(task="multiclass", num_classes=NUM_CLASSES, average="macro"),
-            "ap": metrics.AveragePrecision(task="multiclass", num_classes=NUM_CLASSES, average="macro"),
-            "precision": metrics.Precision(task="multiclass", num_classes=NUM_CLASSES, average="macro"),
-            "recall": metrics.Recall(task="multiclass", num_classes=NUM_CLASSES, average="macro"),
-            "f1": metrics.F1Score(task="multiclass", num_classes=NUM_CLASSES, average="macro"),
-            "accuracy": metrics.Accuracy(task="multiclass", num_classes=NUM_CLASSES, average="macro"),
-            # set average="macro" per https://github.com/Lightning-AI/torchmetrics/issues/543
+            "auroc": metrics.BinaryAUROC(),
+            "ap": metrics.BinaryAveragePrecision(),
+            "precision": metrics.BinaryPrecision(),
+            "recall": metrics.BinaryRecall(),
+            "specificity": metrics.BinarySpecificity(),
+            "f1": metrics.BinaryF1Score(),
+            "accuracy": metrics.BinaryAccuracy(),
         }).to(self.gpu_id)
         
         dataloader = self.test_dataloader if test else self.val_dataloader
@@ -163,13 +163,14 @@ class Trainer:
                 for batch in dataloader:
                     inputs, targets = batch
                     inputs = inputs.to(self.gpu_id)
-                    targets = targets.to(self.gpu_id)
+                    targets = targets.to(self.gpu_id)  # (batch_size,)
                     outputs = self.model(inputs)  # (batch_size, num_classes)
-                    probs = F.softmax(outputs, dim=-1)
+                    probs = F.softmax(outputs, dim=-1)  # (batch_size, num_classes)
+                    probs_positive_class = probs[:,-1]  # (batch_size,)
 
                     metrics_dict["avg_loss"] += self.loss_fn(outputs, targets)  
                     for metric, fn in torchmetrics_dict.items():
-                        fn(probs, targets)
+                        fn(probs_positive_class, targets)
         
         metrics_dict["avg_loss"] /= len(dataloader)
         for metric, fn in torchmetrics_dict.items():
@@ -217,9 +218,9 @@ class Trainer:
                 print("==================================== \n")
                 if epoch % self.save_every == 0:
                     self._save_snapshot(epoch, self.last_snapshot_path)
-                if self.best_val_acc < metrics_dict["val_accuracy"]:
+                if self.best_val_f1 < metrics_dict["val_f1"]:
                     self._save_snapshot(epoch, self.best_snapshot_path)
-                    self.best_val_acc = metrics_dict["val_accuracy"]
+                    self.best_val_f1 = metrics_dict["val_f1"]
         
         if self.evaluate_on_final_test_set:
             print("Finished training for {max_epochs} epochs. Evaluating best model snapshot on final test set")
@@ -249,15 +250,6 @@ def _default_data_transform():
         transforms.ToTensor(),
         transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
     ])
-    
-    # for torchvision.transforms.v2
-    # return transforms.Compose([
-    #     transforms.Resize(RETFOUND_EXPECTED_IMAGE_SIZE, 
-    #                       interpolation=transforms.InterpolationMode.BICUBIC),
-    #     transforms.CenterCrop(RETFOUND_EXPECTED_IMAGE_SIZE),  # or Resize([224, 224])? 
-    #     transforms.ToDtype(torch.float32, scale=True),
-    #     transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
-    # ])
 
 
 def _augment_data_transform(augment: str):
@@ -292,10 +284,10 @@ def _augment_data_transform(augment: str):
     assert augment in augmentations, f"Data augmentation strategy must be 'none' or one of {list(augmentations.keys())}"
 
     return transforms.Compose([
-        augmentations[augment],
         transforms.Resize(RETFOUND_EXPECTED_IMAGE_SIZE, 
                           interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(RETFOUND_EXPECTED_IMAGE_SIZE),  # or Resize([224, 224])? 
+        transforms.CenterCrop(RETFOUND_EXPECTED_IMAGE_SIZE),  # or Resize([224, 224])?
+        augmentations[augment], 
         transforms.ToTensor(),
         transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
     ])
@@ -339,6 +331,7 @@ def _setup_dataloader(dataset: Dataset, batch_size: int, collate_fn=None):
     return DataLoader(
         dataset,
         batch_size=batch_size,
+        num_workers=4,
         pin_memory=True,
         shuffle=False,  # no shuffling as we want to preserve the order of the images
         sampler=DistributedSampler(dataset),  # for DDP
@@ -566,7 +559,7 @@ def main(args):
     best_snapshot_path = args.best_snapshot_path + "/best.pth"
 
     # Set up training objects
-    train_dataloader, val_dataloader, test_dataloader = setup_data(dataset_path, args.batch_size, args.dataset_size, args.augment, args.cutmixup)
+    train_dataloader, val_dataloader, test_dataloader = setup_data(dataset_path, args.batch_size, args.dataset_size, args.augment)
     model = setup_model(model_arch=args.model_arch, modality=args.modality, training_strategy=args.training_strategy, global_pool=args.global_average_pooling)
     optimizer = setup_optimizer(model, algo=args.optimizer, training_strategy=args.training_strategy, lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = setup_lr_scheduler(optimizer, args.total_epochs)
@@ -605,20 +598,15 @@ def main(args):
     
     # Otherwise, train model
     else: 
-        try:
-            trainer.train(args.total_epochs)
-        except Exception as e:
-            print("An exception occurred during training: ", e)
-            traceback.print_exc()
-        else:  
-            # If training finishes successfully, delete the last.pth model snapshot using gpu 0
-            # and rename best.pth to [wandb_run_name].pth
-            if gpu_id == 0:
-                print(f"\nTraining completed successfully! Deleting last.pth and saving best.pth as {wandb.run.name}.pth\n")
-                if os.path.exists(last_snapshot_path): 
-                    os.remove(last_snapshot_path)
-                if os.path.exists(best_snapshot_path):
-                    os.rename(best_snapshot_path, f"{args.best_snapshot_path}/{wandb.run.name}.pth")
+        trainer.train(args.total_epochs)
+        # If training finishes successfully, delete the last.pth model snapshot using gpu 0
+        # and rename best.pth to [wandb_run_name].pth
+        if gpu_id == 0:
+            print(f"\nTraining completed successfully! Deleting last.pth and saving best.pth as {wandb.run.name}.pth\n")
+            if os.path.exists(last_snapshot_path): 
+                os.remove(last_snapshot_path)
+            if os.path.exists(best_snapshot_path):
+                os.rename(best_snapshot_path, f"{args.best_snapshot_path}/{wandb.run.name}.pth")
 
     # Clean up
     wandb.finish()
@@ -639,21 +627,21 @@ if __name__ == "__main__":
     # Data Hyperparameters
     parser.add_argument('--dataset_size', type=int, help='Number of training images to train the model with.')  # CFP: 650, OCT: 914
     parser.add_argument('--augment', type=str, default="randaugment", help='Data augmentation strategy: none, trivialaugment, randaugment, autoaugment, augmix, deit3') 
-    parser.add_argument('--cutmixup', type=bool, default=False, help='Whether to use CutMix/MixUp data augmentation')  # TODO: debug
+    # parser.add_argument('--cutmixup', type=bool, default=False, help='Whether to use CutMix/MixUp data augmentation')  # TODO: add/fix cutmixup
     
     # Training Hyperparameters
     parser.add_argument('--model_arch', type=str, default="retfound", help='Model architecture: resnet50, vit_large, retfound')
-    parser.add_argument('--training_strategy', type=str, default="full_finetune", help="Training strategy: full_finetune, linear_probe, lora")  # TODO: fix linear_probe, add lora
-    parser.add_argument('--total_epochs', type=int, default=20, help='Total epochs to train the model')  # 10 epochs with full dataset
+    parser.add_argument('--training_strategy', type=str, default="full_finetune", help="Training strategy: full_finetune")  # TODO: add linear_probe, lora
+    parser.add_argument('--total_epochs', type=int, default=20, help='Total epochs to train the model')
     parser.add_argument('--batch_size', type=int, default=64, help='Input batch size on each device')  # max batch_size with AMP {full_finetune: 64, linear_probe: 1024+}
     parser.add_argument('--grad_accum_steps', type=int, default=1, help='Number of gradient accumulation steps before performing optimizer step. Effective batch size becomes batch_size * gradient_accumulation_steps * num_gpus')
     
     parser.add_argument('--optimizer', type=str, default="lars", help='Optimizer: adam, adamw, lars, lamb')
-    parser.add_argument('--learning_rate', type=float, default=0.25, help='Learning rate')
+    parser.add_argument('--learning_rate', type=float, default=0.3, help='Learning rate')
     parser.add_argument('--lr_scheduler', type=str, help='Learning rate scheduler: none, cosine_linear_warmup')  
     parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay')
     
-    parser.add_argument('--global_average_pooling', type=bool, default=False, help='Use global average pooling')  # TODO: debug
+    # parser.add_argument('--global_average_pooling', type=bool, default=False, help='Use global average pooling')  # TODO: debug
     parser.add_argument('--mixed_precision', type=bool, default=True, help='Use automatic mixed precision')
     parser.add_argument('--save_every', type=int, default=1, help='Save a snapshot every _ epochs')
 
