@@ -8,7 +8,8 @@
 import argparse
 from contextlib import nullcontext
 import os
-import traceback
+from operator import itemgetter
+from typing import Optional
 
 import torch
 from torch.distributed import init_process_group, destroy_process_group
@@ -35,6 +36,7 @@ OCT_CHKPT_PATH = "/home/dkuo/RetFound/model_checkpoints/RETFound_oct_weights.pth
 
 CFP_DATASET_PATH = "/home/dkuo/RetFound/tasks/referable_CFP_OCT/dataset/CFP"
 OCT_DATASET_PATH = "/home/dkuo/RetFound/tasks/referable_CFP_OCT/dataset/OCT"
+PEDS_OPTOS_DATASET_PATH = "/home/dkuo/RetFound/tasks/peds_optos/dataset"
 
 RETFOUND_EXPECTED_IMAGE_SIZE = 224
 NUM_CLASSES = 2
@@ -82,7 +84,8 @@ class Trainer:
         self.last_snapshot_path = last_snapshot_path
         self.best_snapshot_path = best_snapshot_path
         self.test_snapshot_path = test_snapshot_path
-        self.best_val_f1 = 0.0  # given imbalanced dataset, also consider average precision
+        self.best_val_ap = 0.0  # given imbalanced dataset
+
         if os.path.exists(last_snapshot_path):
             print("Loading snapshot")
             self._load_snapshot(last_snapshot_path)
@@ -97,8 +100,8 @@ class Trainer:
         self.model.module.load_state_dict(snapshot["MODEL_STATE"])  # alternatively, use self.model.load_state_dict(...) but save self.model.state_dict() in _save_snapshot()
         self.optimizer.load_state_dict(snapshot["OPTIMIZER_STATE"])
         self.epochs_run = snapshot["EPOCHS_RUN"]
-        self.best_val_acc = snapshot["BEST_VAL_ACC"]
-        print(f"Successfully loaded snapshot from Epoch {self.epochs_run}. Best validation accuracy so far: {self.best_val_acc}")
+        self.best_val_ap = snapshot["BEST_VAL_AP"]
+        print(f"Successfully loaded snapshot from Epoch {self.epochs_run}. Best validation AP so far: {self.best_val_ap}")
     
     def _save_snapshot(self, epoch: int, snapshot_path: str):
         """ Save snapshot of current model """
@@ -106,7 +109,7 @@ class Trainer:
             "MODEL_STATE": self.model.module.state_dict(),  # actual model is module wrapped by DDP
             "OPTIMIZER_STATE": self.optimizer.state_dict(),
             "EPOCHS_RUN": epoch,
-            "BEST_VAL_ACC": self.best_val_acc,
+            "BEST_VAL_AP": self.best_val_ap,
         }
         torch.save(snapshot, snapshot_path)
         print(f"Epoch {epoch} | Training snapshot saved at {snapshot_path}")
@@ -173,13 +176,12 @@ class Trainer:
                         fn(probs_positive_class, targets)
         
         metrics_dict["avg_loss"] /= len(dataloader)
+        torch.distributed.reduce(metrics_dict["avg_loss"], op=torch.distributed.ReduceOp.AVG, dst=0) # avg across all GPUs and send to rank 0 process
+
         for metric, fn in torchmetrics_dict.items():
-            metrics_dict[metric] = fn.compute()
+            metrics_dict[metric] = fn.compute()  # .compute() syncs across all GPUs
             fn.reset()
 
-        for metric, value in metrics_dict.items():
-            torch.distributed.reduce(value, op=torch.distributed.ReduceOp.AVG, dst=0) # avg across all GPUs and send to rank 0 process
-        
         if self.gpu_id == 0:
             for metric, value in metrics_dict.items():
                 print(f"- {metric}: {value.item()}")
@@ -218,9 +220,9 @@ class Trainer:
                 print("==================================== \n")
                 if epoch % self.save_every == 0:
                     self._save_snapshot(epoch, self.last_snapshot_path)
-                if self.best_val_f1 < metrics_dict["val_f1"]:
+                if self.best_val_ap < metrics_dict["val_ap"]:
                     self._save_snapshot(epoch, self.best_snapshot_path)
-                    self.best_val_f1 = metrics_dict["val_f1"]
+                    self.best_val_ap = metrics_dict["val_ap"]
         
         if self.evaluate_on_final_test_set:
             print("Finished training for {max_epochs} epochs. Evaluating best model snapshot on final test set")
@@ -233,6 +235,88 @@ class Trainer:
         metrics_dict = self._validate(test=True)
         if self.gpu_id == 0:
             print(f"Test Set Performance for {self.test_snapshot_path}: \n{metrics_dict}")
+
+
+# From https://github.com/catalyst-team/catalyst/blob/ea3fadbaa6034dabeefbbb53ab8c310186f6e5d0/catalyst/data/dataset/torch.py#L13
+class DatasetFromSampler(Dataset):
+    """Dataset to create indexes from `Sampler`.
+
+    Args:
+        sampler: PyTorch sampler
+    """
+
+    def __init__(self, sampler: torch.utils.data.Sampler):
+        """Initialisation for DatasetFromSampler."""
+        self.sampler = sampler
+        self.sampler_list = None
+
+    def __getitem__(self, index: int):
+        """Gets element of the dataset.
+
+        Args:
+            index: index of the element in the dataset
+
+        Returns:
+            Single element by index
+        """
+        if self.sampler_list is None:
+            self.sampler_list = list(self.sampler)
+        return self.sampler_list[index]
+
+    def __len__(self) -> int:
+        """
+        Returns:
+            int: length of the dataset
+        """
+        return len(self.sampler)
+
+
+# From https://github.com/catalyst-team/catalyst/blob/ea3fadbaa6034dabeefbbb53ab8c310186f6e5d0/catalyst/data/sampler.py#L522
+class DistributedSamplerWrapper(DistributedSampler):
+    """
+    Wrapper over `Sampler` for distributed training.
+    Allows you to use any sampler in distributed mode.
+
+    It is especially useful in conjunction with
+    `torch.nn.parallel.DistributedDataParallel`. In such case, each
+    process can pass a DistributedSamplerWrapper instance as a DataLoader
+    sampler, and load a subset of subsampled data of the original dataset
+    that is exclusive to it.
+
+    .. note::
+        Sampler is assumed to be of constant size.
+    """
+
+    def __init__(
+        self,
+        sampler,
+        num_replicas: Optional[int] = None,
+        rank: Optional[int] = None,
+        shuffle: bool = True,
+    ):
+        """
+        Args:
+            sampler: Sampler used for subsampling
+            num_replicas (int, optional): Number of processes participating in
+              distributed training
+            rank (int, optional): Rank of the current process
+              within ``num_replicas``
+            shuffle (bool, optional): If true (default),
+              sampler will shuffle the indices
+        """
+        super(DistributedSamplerWrapper, self).__init__(
+            DatasetFromSampler(sampler),
+            num_replicas=num_replicas,
+            rank=rank,
+            shuffle=shuffle,
+        )
+        self.sampler = sampler
+
+    def __iter__(self):
+        self.dataset = DatasetFromSampler(self.sampler)
+        indexes_of_indexes = super().__iter__()
+        subsampler_indexes = self.dataset
+        return iter(itemgetter(*indexes_of_indexes)(subsampler_indexes))
 
 
 def setup_ddp():
@@ -311,7 +395,7 @@ def _cutmixup_collate_fn(batch):
     # return cutmix_or_mixup(*default_collate(batch))
 
 
-def _setup_dataloader(dataset: Dataset, batch_size: int, collate_fn=None):
+def _setup_dataloader(dataset: Dataset, batch_size: int, sampler: torch.utils.data.Sampler = None, collate_fn=None):
     """
     Parameters
     ----------
@@ -319,6 +403,8 @@ def _setup_dataloader(dataset: Dataset, batch_size: int, collate_fn=None):
         Dataset to load
     batch_size : int
         Batch size for dataloader
+    sampler : torch.utils.data.Sampler, optional
+        Sampler for dataloader, by default None which defaults to DistributedSampler
     collate_fn : callable, optional
         Function to collate batch of data, by default None
         Use cutmixup_collate_fn for CutMix/MixUp data augmentation
@@ -334,12 +420,12 @@ def _setup_dataloader(dataset: Dataset, batch_size: int, collate_fn=None):
         num_workers=4,
         pin_memory=True,
         shuffle=False,  # no shuffling as we want to preserve the order of the images
-        sampler=DistributedSampler(dataset),  # for DDP
+        sampler=DistributedSampler(dataset) if sampler is None else sampler,  # for DDP
         collate_fn=collate_fn,
     )
 
 
-def setup_data(dataset_path: str, batch_size: int, dataset_size: int = None, augment: str = "none", cutmixup: bool = False):
+def setup_data(dataset_path: str, batch_size: int, resample: bool = False, dataset_size: int = None, augment: str = "none", cutmixup: bool = False):
     """
     Parameters
     ----------
@@ -347,6 +433,8 @@ def setup_data(dataset_path: str, batch_size: int, dataset_size: int = None, aug
         Path to root directory of PyTorch ImageFolder dataset
     batch_size : int
         Batch size for dataloaders
+    resample : bool, optional
+        Whether to resample training dataset to balance classes, by default False
     dataset_size : int, optional
         Number of images to sample from the training set. Use all images if not specified.
     augment : str, optional
@@ -368,12 +456,28 @@ def setup_data(dataset_path: str, batch_size: int, dataset_size: int = None, aug
     val_dataset = datasets.ImageFolder(dataset_path + "/val", transform=_default_data_transform())
     test_dataset = datasets.ImageFolder(dataset_path + "/test", transform=_default_data_transform())
 
+    # If specified, resample training dataset to balance classes with WeightedRandomSampler and wrap with DistributedSamplerWrapper for DDP
+    # https://discuss.pytorch.org/t/how-to-handle-imbalanced-classes/11264
+    # https://discuss.pytorch.org/t/how-to-get-no-of-images-in-every-class-by-datasets-imagefolder/81599 
+    # https://github.com/pytorch/pytorch/issues/23430#issuecomment-750037457 
+    if resample:  
+        targets = torch.Tensor(train_dataset.targets).int()
+        _, class_counts = torch.unique(targets, return_counts=True)
+        class_weights = 1./class_counts
+        sample_weights = torch.Tensor([class_weights[t].item() for t in targets])
+        train_sampler = torch.utils.data.WeightedRandomSampler(sample_weights, len(sample_weights))
+        train_sampler = DistributedSamplerWrapper(train_sampler)  # for DDP
+    else:
+        train_sampler = None
+    
     # If specified, take a random subset of the training dataset of size 'dataset_size' 
     if dataset_size:
-        train_dataset = torch.utils.data.Subset(train_dataset, torch.randperm(len(train_dataset))[:dataset_size])
+        indices = torch.randperm(len(train_dataset))[:dataset_size]
+        print(indices)
+        train_dataset = torch.utils.data.Subset(train_dataset, indices)
     
     # Set up and return dataloaders
-    train_dataloader = _setup_dataloader(train_dataset, args.batch_size, train_collate_fn)
+    train_dataloader = _setup_dataloader(train_dataset, args.batch_size, train_sampler, train_collate_fn)
     val_dataloader = _setup_dataloader(val_dataset, args.batch_size)
     test_dataloader = _setup_dataloader(test_dataset, args.batch_size)
 
@@ -542,8 +646,11 @@ def setup_loss_fn():
     # OCT training set has 782 normal and 132 referable (0.17) -> class_weights = [1.0, 5.0]
     # peds_optos
     # CFP training set has 148 abnormal and 68 normal (0.43) -> class_weights = [1.0, 2.3]
-    class_weights = torch.tensor([1.0, 2.3]).cuda()  # [normal, referable]
-    return torch.nn.CrossEntropyLoss(weight=class_weights)  
+
+    # class_weights = torch.tensor([1.0, 5.0]).cuda()  # [normal, referable]
+    return torch.nn.CrossEntropyLoss(
+        # weight=class_weights,
+    )  
 
 
 def main(args):
@@ -555,12 +662,12 @@ def main(args):
     dataset_path = args.dataset_path if args.dataset_path else (CFP_DATASET_PATH if args.modality == "CFP" else OCT_DATASET_PATH) 
 
     # Set up model checkpoint paths
-    last_snapshot_path = args.last_snapshot_path + "/last.pth"
-    best_snapshot_path = args.best_snapshot_path + "/best.pth"
+    last_snapshot_path = args.snapshot_path + "/last.pth"
+    best_snapshot_path = args.snapshot_path + "/best.pth"
 
     # Set up training objects
-    train_dataloader, val_dataloader, test_dataloader = setup_data(dataset_path, args.batch_size, args.dataset_size, args.augment)
-    model = setup_model(model_arch=args.model_arch, modality=args.modality, training_strategy=args.training_strategy, global_pool=args.global_average_pooling)
+    train_dataloader, val_dataloader, test_dataloader = setup_data(dataset_path, args.batch_size, args.resample, args.dataset_size, args.augment)
+    model = setup_model(model_arch=args.model_arch, modality=args.modality, training_strategy=args.training_strategy)
     optimizer = setup_optimizer(model, algo=args.optimizer, training_strategy=args.training_strategy, lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = setup_lr_scheduler(optimizer, args.total_epochs)
     loss_fn = setup_loss_fn()
@@ -606,7 +713,7 @@ def main(args):
             if os.path.exists(last_snapshot_path): 
                 os.remove(last_snapshot_path)
             if os.path.exists(best_snapshot_path):
-                os.rename(best_snapshot_path, f"{args.best_snapshot_path}/{wandb.run.name}.pth")
+                os.rename(best_snapshot_path, f"{args.snapshot_path}/{wandb.run.name}.pth")
 
     # Clean up
     wandb.finish()
@@ -620,11 +727,12 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=0, help='Random seed')
 
     # Task parameters
-    parser.add_argument('--modality', type=str, default="OCT", help='Must be CFP or OCT')
+    parser.add_argument('--modality', type=str, default="CFP", help='Must be CFP or OCT')
     parser.add_argument('--dataset_path', type=str, help='Path to root directory of PyTorch ImageFolder dataset')
     parser.add_argument('--wandb_proj_name', default="retfound_referable_cfp_oct", type=str, help='Name of W&B project to log to')   
         
     # Data Hyperparameters
+    parser.add_argument('--resample', type=bool, default=True, help='Resample training data to balance classes')
     parser.add_argument('--dataset_size', type=int, help='Number of training images to train the model with.')  # CFP: 650, OCT: 914
     parser.add_argument('--augment', type=str, default="randaugment", help='Data augmentation strategy: none, trivialaugment, randaugment, autoaugment, augmix, deit3') 
     # parser.add_argument('--cutmixup', type=bool, default=False, help='Whether to use CutMix/MixUp data augmentation')  # TODO: add/fix cutmixup
@@ -646,12 +754,9 @@ if __name__ == "__main__":
     parser.add_argument('--save_every', type=int, default=1, help='Save a snapshot every _ epochs')
 
     # Model snapshot paths
-    parser.add_argument('--last_snapshot_path', type=str, 
+    parser.add_argument('--snapshot_path', type=str, 
                         default="/home/dkuo/RetFound/tasks/referable_CFP_OCT/snapshots",
-                        help='Path to directory for saving last training snapshot (will be saved as last.pth)')
-    parser.add_argument('--best_snapshot_path', type=str, 
-                        default="/home/dkuo/RetFound/tasks/referable_CFP_OCT/snapshots",
-                        help='Path to directory for saving best snapshot so far (will be saved as best.pth)')
+                        help='Path to directory for saving training snapshots (last will be saved as last.pth, best so far will be saved as best.pth)')
     
     # Evaluate on final test set
     parser.add_argument('--evaluate_on_final_test_set', action='store_true', help='Evaluate best model snapshot on final test set at the end of training')
