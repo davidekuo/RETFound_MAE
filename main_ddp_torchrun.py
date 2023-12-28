@@ -10,6 +10,9 @@ from contextlib import nullcontext
 import os
 from operator import itemgetter
 from typing import Optional
+import random
+import numpy as np
+import wandb
 
 import torch
 from torch.distributed import init_process_group, destroy_process_group
@@ -29,7 +32,7 @@ from timm.models.layers import trunc_normal_
 import models_vit
 from util.lars import LARS
 from util.pos_embed import interpolate_pos_embed
-import wandb
+
 
 CFP_CHKPT_PATH = "/home/dkuo/RetFound/model_checkpoints/RETFound_cfp_weights.pth"
 OCT_CHKPT_PATH = "/home/dkuo/RetFound/model_checkpoints/RETFound_oct_weights.pth"
@@ -112,7 +115,7 @@ class Trainer:
             "BEST_VAL_AP": self.best_val_ap,
         }
         torch.save(snapshot, snapshot_path)
-        print(f"Epoch {epoch} | Training snapshot saved at {snapshot_path}")
+        # print(f"Epoch {epoch} | Training snapshot saved at {snapshot_path}")
     
     def _train_batch(self, index: int, inputs: torch.Tensor, targets: torch.Tensor):
         """ Train on one batch """
@@ -127,13 +130,13 @@ class Trainer:
                 loss = self.loss_fn(outputs, targets)
                 preds = torch.argmax(outputs, dim=-1)  # (batch_size)
                 train_acc = torch.sum(preds == targets) / len(targets)
-                print(f"[GPU{self.gpu_id}] Training loss: {loss}, Training accuracy: {train_acc}")
+                # print(f"[GPU{self.gpu_id}] Training loss: {loss}, Training accuracy: {train_acc}")
 
                 # avg across all GPUs and send to rank 0 process
                 torch.distributed.reduce(loss, op=torch.distributed.ReduceOp.AVG, dst=0)
                 torch.distributed.reduce(train_acc, op=torch.distributed.ReduceOp.AVG, dst=0)
                 if self.gpu_id == 0:
-                    print(f"[MEAN] Training loss: {loss}, Training accuracy: {train_acc} \n")
+                    # print(f"[MEAN] Training loss: {loss}, Training accuracy: {train_acc} \n")
                     wandb.log({"train_loss": loss, "train_acc": train_acc})
                 
                 self.scaler.scale(loss).backward() if self.mixed_precision else loss.backward()
@@ -195,8 +198,8 @@ class Trainer:
 
     def _train_epoch(self, epoch: int):
         """ Train for one epoch """
-        batch_size = len(next(iter(self.train_dataloader))[0])
-        print(f"\n[GPU{self.gpu_id}] Epoch {epoch} | Batch size {batch_size} | Steps: {len(self.train_dataloader)}")
+        # batch_size = len(next(iter(self.train_dataloader))[0])
+        # print(f"\n[GPU{self.gpu_id}] Epoch {epoch} | Batch size {batch_size} | Steps: {len(self.train_dataloader)}")
         self.train_dataloader.sampler.set_epoch(epoch)
         
         for index, batch in enumerate(self.train_dataloader):
@@ -225,7 +228,7 @@ class Trainer:
                     self.best_val_ap = metrics_dict["val_ap"]
         
         if self.evaluate_on_final_test_set:
-            print("Finished training for {max_epochs} epochs. Evaluating best model snapshot on final test set")
+            print(f"Finished training for {max_epochs} epochs. Evaluating best model snapshot on final test set")
             self.test_snapshot_path = self.best_snapshot_path
             self.test()
     
@@ -234,7 +237,10 @@ class Trainer:
         self._load_snapshot(self.test_snapshot_path)
         metrics_dict = self._validate(test=True)
         if self.gpu_id == 0:
-            print(f"Test Set Performance for {self.test_snapshot_path}: \n{metrics_dict}")
+            print("\n=== Test Set Performance Metrics ===")
+            for metric, value in metrics_dict.items():
+                print(f"- {metric}: {value}")
+            print("====================================\n")
 
 
 # From https://github.com/catalyst-team/catalyst/blob/ea3fadbaa6034dabeefbbb53ab8c310186f6e5d0/catalyst/data/dataset/torch.py#L13
@@ -425,7 +431,7 @@ def _setup_dataloader(dataset: Dataset, batch_size: int, sampler: torch.utils.da
     )
 
 
-def setup_data(dataset_path: str, batch_size: int, resample: bool = False, dataset_size: int = None, augment: str = "none", cutmixup: bool = False):
+def setup_data(dataset_path: str, batch_size: int, random_seed: int, resample: bool = False, dataset_size: int = None, augment: str = "none", cutmixup: bool = False):
     """
     Parameters
     ----------
@@ -433,6 +439,8 @@ def setup_data(dataset_path: str, batch_size: int, resample: bool = False, datas
         Path to root directory of PyTorch ImageFolder dataset
     batch_size : int
         Batch size for dataloaders
+    random_seed : int
+        Random seed for reproducibility
     resample : bool, optional
         Whether to resample training dataset to balance classes, by default False
     dataset_size : int, optional
@@ -456,25 +464,30 @@ def setup_data(dataset_path: str, batch_size: int, resample: bool = False, datas
     val_dataset = datasets.ImageFolder(dataset_path + "/val", transform=_default_data_transform())
     test_dataset = datasets.ImageFolder(dataset_path + "/test", transform=_default_data_transform())
 
-    # If specified, resample training dataset to balance classes with WeightedRandomSampler and wrap with DistributedSamplerWrapper for DDP
-    # https://discuss.pytorch.org/t/how-to-handle-imbalanced-classes/11264
-    # https://discuss.pytorch.org/t/how-to-get-no-of-images-in-every-class-by-datasets-imagefolder/81599 
-    # https://github.com/pytorch/pytorch/issues/23430#issuecomment-750037457 
-    if resample:  
-        targets = torch.Tensor(train_dataset.targets).int()
-        _, class_counts = torch.unique(targets, return_counts=True)
-        class_weights = 1./class_counts
-        sample_weights = torch.Tensor([class_weights[t].item() for t in targets])
-        train_sampler = torch.utils.data.WeightedRandomSampler(sample_weights, len(sample_weights))
-        train_sampler = DistributedSamplerWrapper(train_sampler)  # for DDP
-    else:
-        train_sampler = None
-    
     # If specified, take a random subset of the training dataset of size 'dataset_size' 
     if dataset_size:
         indices = torch.randperm(len(train_dataset))[:dataset_size]
         print(indices)
         train_dataset = torch.utils.data.Subset(train_dataset, indices)
+
+    # If specified, resample training dataset to balance classes with WeightedRandomSampler and wrap with DistributedSamplerWrapper for DDP
+    # https://discuss.pytorch.org/t/how-to-handle-imbalanced-classes/11264
+    # https://discuss.pytorch.org/t/how-to-get-no-of-images-in-every-class-by-datasets-imagefolder/81599 
+    # https://github.com/pytorch/pytorch/issues/23430#issuecomment-750037457 
+    if resample:  
+        # Set up random number generator for reproducibility
+        prng = torch.Generator()
+        prng.manual_seed(random_seed)
+        # Calculate weights for each sample in training dataset
+        targets = torch.Tensor(train_dataset.targets).int()
+        _, class_counts = torch.unique(targets, return_counts=True)
+        class_weights = 1./class_counts
+        sample_weights = torch.Tensor([class_weights[t].item() for t in targets])
+        # Set up sampler
+        train_sampler = torch.utils.data.WeightedRandomSampler(sample_weights, len(sample_weights), generator=prng)
+        train_sampler = DistributedSamplerWrapper(train_sampler)  # for DDP
+    else:
+        train_sampler = None
     
     # Set up and return dataloaders
     train_dataloader = _setup_dataloader(train_dataset, args.batch_size, train_sampler, train_collate_fn)
@@ -653,9 +666,15 @@ def setup_loss_fn():
     )  
 
 
+def set_seed_everywhere(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
 def main(args):
     setup_ddp()
-    torch.manual_seed(args.seed)
+    set_seed_everywhere(args.seed)
 
     # Set up correct dataset paths for modality
     assert args.modality in ["CFP", "OCT"], "Modality must be CFP or OCT"
@@ -666,7 +685,7 @@ def main(args):
     best_snapshot_path = args.snapshot_path + "/best.pth"
 
     # Set up training objects
-    train_dataloader, val_dataloader, test_dataloader = setup_data(dataset_path, args.batch_size, args.resample, args.dataset_size, args.augment)
+    train_dataloader, val_dataloader, test_dataloader = setup_data(dataset_path, args.batch_size, args.seed, args.resample, args.dataset_size, args.augment)
     model = setup_model(model_arch=args.model_arch, modality=args.modality, training_strategy=args.training_strategy)
     optimizer = setup_optimizer(model, algo=args.optimizer, training_strategy=args.training_strategy, lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = setup_lr_scheduler(optimizer, args.total_epochs)
@@ -738,11 +757,13 @@ if __name__ == "__main__":
     # parser.add_argument('--cutmixup', type=bool, default=False, help='Whether to use CutMix/MixUp data augmentation')  # TODO: add/fix cutmixup
     
     # Training Hyperparameters
+    parser.add_argument('--training_strategy', type=str, default="full_finetune", help="Training strategy: full_finetune")  # TODO: add surgical fine-tuning, ...
+    parser.add_argument('--mixed_precision', type=bool, default=True, help='Use automatic mixed precision')
     parser.add_argument('--model_arch', type=str, default="retfound", help='Model architecture: resnet50, vit_large, retfound')
-    parser.add_argument('--training_strategy', type=str, default="full_finetune", help="Training strategy: full_finetune")  # TODO: add linear_probe, lora
-    parser.add_argument('--total_epochs', type=int, default=20, help='Total epochs to train the model')
+    
     parser.add_argument('--batch_size', type=int, default=64, help='Input batch size on each device')  # max batch_size with AMP {full_finetune: 64, linear_probe: 1024+}
     parser.add_argument('--grad_accum_steps', type=int, default=1, help='Number of gradient accumulation steps before performing optimizer step. Effective batch size becomes batch_size * gradient_accumulation_steps * num_gpus')
+    parser.add_argument('--total_epochs', type=int, default=20, help='Total epochs to train the model')
     
     parser.add_argument('--optimizer', type=str, default="lars", help='Optimizer: adam, adamw, lars, lamb')
     parser.add_argument('--learning_rate', type=float, default=0.3, help='Learning rate')
@@ -750,10 +771,9 @@ if __name__ == "__main__":
     parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay')
     
     # parser.add_argument('--global_average_pooling', type=bool, default=False, help='Use global average pooling')  # TODO: debug
-    parser.add_argument('--mixed_precision', type=bool, default=True, help='Use automatic mixed precision')
-    parser.add_argument('--save_every', type=int, default=1, help='Save a snapshot every _ epochs')
 
-    # Model snapshot paths
+    # Checkpointing parameters
+    parser.add_argument('--save_every', type=int, default=1, help='Save a snapshot every _ epochs')
     parser.add_argument('--snapshot_path', type=str, 
                         default="/home/dkuo/RetFound/tasks/referable_CFP_OCT/snapshots",
                         help='Path to directory for saving training snapshots (last will be saved as last.pth, best so far will be saved as best.pth)')
