@@ -87,7 +87,7 @@ class Trainer:
         self.last_snapshot_path = last_snapshot_path
         self.best_snapshot_path = best_snapshot_path
         self.test_snapshot_path = test_snapshot_path
-        self.best_val_ap = 0.0  # given imbalanced dataset
+        self.best_val_f1 = 0.0  # given imbalanced dataset
 
         if os.path.exists(last_snapshot_path):
             print("Loading snapshot")
@@ -103,8 +103,8 @@ class Trainer:
         self.model.module.load_state_dict(snapshot["MODEL_STATE"])  # alternatively, use self.model.load_state_dict(...) but save self.model.state_dict() in _save_snapshot()
         self.optimizer.load_state_dict(snapshot["OPTIMIZER_STATE"])
         self.epochs_run = snapshot["EPOCHS_RUN"]
-        self.best_val_ap = snapshot["BEST_VAL_AP"]
-        print(f"Successfully loaded snapshot from Epoch {self.epochs_run}. Best validation AP so far: {self.best_val_ap}")
+        self.best_val_f1 = snapshot["BEST_VAL_F1"]
+        print(f"Successfully loaded snapshot from Epoch {self.epochs_run}. Best validation F1 so far: {self.best_val_f1}")
     
     def _save_snapshot(self, epoch: int, snapshot_path: str):
         """ Save snapshot of current model """
@@ -112,7 +112,7 @@ class Trainer:
             "MODEL_STATE": self.model.module.state_dict(),  # actual model is module wrapped by DDP
             "OPTIMIZER_STATE": self.optimizer.state_dict(),
             "EPOCHS_RUN": epoch,
-            "BEST_VAL_AP": self.best_val_ap,
+            "BEST_VAL_F1": self.best_val_f1,
         }
         torch.save(snapshot, snapshot_path)
         # print(f"Epoch {epoch} | Training snapshot saved at {snapshot_path}")
@@ -204,7 +204,7 @@ class Trainer:
         
         for index, batch in enumerate(self.train_dataloader):
             inputs, targets = batch
-            inputs = inputs.to(self.gpu_id)
+            inputs = inputs.to(self.gpu_id).to(memory_format=torch.channels_last)
             targets = targets.to(self.gpu_id)
             self._train_batch(index, inputs, targets)
         
@@ -223,9 +223,9 @@ class Trainer:
                 print("==================================== \n")
                 if epoch % self.save_every == 0:
                     self._save_snapshot(epoch, self.last_snapshot_path)
-                if self.best_val_ap < metrics_dict["val_ap"]:
+                if self.best_val_f1 < metrics_dict["val_f1"]:
                     self._save_snapshot(epoch, self.best_snapshot_path)
-                    self.best_val_ap = metrics_dict["val_ap"]
+                    self.best_val_f1 = metrics_dict["val_f1"]
         
         if self.evaluate_on_final_test_set:
             print(f"Finished training for {max_epochs} epochs. Evaluating best model snapshot on final test set")
@@ -541,7 +541,7 @@ def setup_model(
             global_pool=global_pool,
         )
         # load mae checkpoint
-        mae_checkpoint_path = CFP_CHKPT_PATH if modality == "CFP" else OCT_CHKPT_PATH
+        mae_checkpoint_path = OCT_CHKPT_PATH if modality == "OCT" else CFP_CHKPT_PATH
         print(f"Loading model from {mae_checkpoint_path}")
         mae_checkpoint = torch.load(mae_checkpoint_path, map_location='cpu')
         mae_checkpoint_model = mae_checkpoint["model"]
@@ -572,6 +572,7 @@ def setup_model(
             for name, param in model.head.named_parameters():
                 param.requires_grad = True
     
+    model = model.to(memory_format=torch.channels_last)  # for faster training with convolutional, pooling layers
     return model
 
 
@@ -647,8 +648,13 @@ def setup_lr_scheduler(optimizer: torch.optim.Optimizer, total_epochs: int, algo
     return scheduler
 
 
-def setup_loss_fn():
+def setup_loss_fn(modality: str = "none"):
     """
+    Parameters
+    ----------
+    modality : str
+        Modality: CFP, OCT, PEDS_OPTOS, none. If none, do not weight loss function.
+
     Returns
     -------
     loss_fn : torch.nn.Module
@@ -657,12 +663,17 @@ def setup_loss_fn():
     # referable_CFP_OCT
     # CFP training set has 548 normal and 102 referable (0.19) -> class_weights = [1.0, 5.0]
     # OCT training set has 782 normal and 132 referable (0.17) -> class_weights = [1.0, 5.0]
+    
     # peds_optos
     # CFP training set has 148 abnormal and 68 normal (0.43) -> class_weights = [1.0, 2.3]
 
-    # class_weights = torch.tensor([1.0, 5.0]).cuda()  # [normal, referable]
+    class_weights = {
+        "CFP": torch.tensor([1.0, 5.0]).cuda(),
+        "OCT": torch.tensor([1.0, 5.0]).cuda(),
+        "PEDS_OPTOS": torch.tensor([1.0, 2.3]).cuda(),
+    }
     return torch.nn.CrossEntropyLoss(
-        # weight=class_weights,
+        weight=class_weights[modality] if modality in class_weights else None,
     )  
 
 
@@ -675,10 +686,16 @@ def set_seed_everywhere(seed: int):
 def main(args):
     setup_ddp()
     set_seed_everywhere(args.seed)
+    torch.backends.cudnn.benchmark = True  # for faster training, requires fixed input size
 
     # Set up correct dataset paths for modality
-    assert args.modality in ["CFP", "OCT"], "Modality must be CFP or OCT"
-    dataset_path = args.dataset_path if args.dataset_path else (CFP_DATASET_PATH if args.modality == "CFP" else OCT_DATASET_PATH) 
+    dataset_paths = {
+            "CFP": CFP_DATASET_PATH,
+            "OCT": OCT_DATASET_PATH,
+            "PEDS_OPTOS": PEDS_OPTOS_DATASET_PATH,
+        }
+    assert args.modality in dataset_paths, "Modality must be CFP, OCT, or PEDS_OPTOS"
+    dataset_path = args.dataset_path if args.dataset_path else dataset_paths[args.modality] 
 
     # Set up model checkpoint paths
     last_snapshot_path = args.snapshot_path + "/last.pth"
@@ -689,7 +706,7 @@ def main(args):
     model = setup_model(model_arch=args.model_arch, modality=args.modality, training_strategy=args.training_strategy)
     optimizer = setup_optimizer(model, algo=args.optimizer, training_strategy=args.training_strategy, lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = setup_lr_scheduler(optimizer, args.total_epochs)
-    loss_fn = setup_loss_fn()
+    loss_fn = setup_loss_fn(args.modality if args.weight_loss_fn else "none")
 
     # Set up W&B logging 
     gpu_id = int(os.environ["LOCAL_RANK"])
@@ -697,7 +714,7 @@ def main(args):
         wandb.init(
             project=args.wandb_proj_name,
             config=args,
-            resume=True,  # continue logging from previous run if did not finish
+            resume=False,  # continue logging from previous run if did not finish
         )
 
     # Set up trainer
@@ -746,12 +763,13 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=0, help='Random seed')
 
     # Task parameters
-    parser.add_argument('--modality', type=str, default="CFP", help='Must be CFP or OCT')
+    parser.add_argument('--modality', type=str, default="OCT", help='Must be OCT, CFP, or PEDS_OPTOS')
     parser.add_argument('--dataset_path', type=str, help='Path to root directory of PyTorch ImageFolder dataset')
     parser.add_argument('--wandb_proj_name', default="retfound_referable_cfp_oct", type=str, help='Name of W&B project to log to')   
         
     # Data Hyperparameters
-    parser.add_argument('--resample', type=bool, default=True, help='Resample training data to balance classes')
+    parser.add_argument('--weight_loss_fn', action='store_true', help='Weight loss function to balance classes')
+    parser.add_argument('--resample', action='store_true', help='Resample training data to balance classes')
     parser.add_argument('--dataset_size', type=int, help='Number of training images to train the model with.')  # CFP: 650, OCT: 914
     parser.add_argument('--augment', type=str, default="randaugment", help='Data augmentation strategy: none, trivialaugment, randaugment, autoaugment, augmix, deit3') 
     # parser.add_argument('--cutmixup', type=bool, default=False, help='Whether to use CutMix/MixUp data augmentation')  # TODO: add/fix cutmixup
@@ -763,7 +781,7 @@ if __name__ == "__main__":
     
     parser.add_argument('--batch_size', type=int, default=64, help='Input batch size on each device')  # max batch_size with AMP {full_finetune: 64, linear_probe: 1024+}
     parser.add_argument('--grad_accum_steps', type=int, default=1, help='Number of gradient accumulation steps before performing optimizer step. Effective batch size becomes batch_size * gradient_accumulation_steps * num_gpus')
-    parser.add_argument('--total_epochs', type=int, default=20, help='Total epochs to train the model')
+    parser.add_argument('--total_epochs', type=int, default=30, help='Total epochs to train the model')
     
     parser.add_argument('--optimizer', type=str, default="lars", help='Optimizer: adam, adamw, lars, lamb')
     parser.add_argument('--learning_rate', type=float, default=0.3, help='Learning rate')
