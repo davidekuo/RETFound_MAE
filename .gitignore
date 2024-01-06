@@ -133,3 +133,6 @@ dmypy.json
 
 # W&B
 wandb/
+
+# Bash scripts
+.sh
