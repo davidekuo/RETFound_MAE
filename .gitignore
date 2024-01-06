@@ -135,4 +135,4 @@ dmypy.json
 wandb/
 
 # Bash scripts
-.sh
+*.sh
