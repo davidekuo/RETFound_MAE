@@ -33,7 +33,7 @@ Pip install dependencies:
 pip install -r requirement.txt
 ```
 
-Download the provided RETFound pre-trained weights to a directory outside of the repository (e.g. ../model_checkpoints/), and modify CFP_CHKPT_PATH and OCT_CHKPT_PATH lines 37 and 38 of `main_ddp_torchrun.py` to point to the correct paths.
+Download the provided RETFound pre-trained weights to a directory outside of the repository (e.g. `../model_checkpoints/`):
 
 <table><tbody>
 <!-- START TABLE -->
@@ -49,3 +49,7 @@ Download the provided RETFound pre-trained weights to a directory outside of the
 <td align="center"><a href="https://drive.google.com/file/d/1m6s7QYkjyjJDlpEuXm7Xp3PmjN-elfW2/view?usp=sharing">download</a></td>
 </tr>
 </tbody></table>
+
+Modify `CFP_CHKPT_PATH`, `OCT_CHKPT_PATH`, and dataset paths in lines 37-42 of `main_ddp_torchrun.py` to point to the correct paths.
+
+Start training!
