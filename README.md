@@ -30,7 +30,7 @@ cd RETFound_MAE
 
 Pip install dependencies:
 ```
-pip install -r requirement.txt
+pip install -r requirements.txt
 ```
 
 Download the provided RETFound pre-trained weights to a directory outside of the repository (e.g. `../model_checkpoints/`):
