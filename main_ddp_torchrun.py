@@ -39,7 +39,7 @@ OCT_CHKPT_PATH = "/home/dkuo/RetFound/model_checkpoints/RETFound_oct_weights.pth
 
 CFP_DATASET_PATH = "/home/dkuo/RetFound/tasks/referable_CFP_OCT/dataset/CFP"
 OCT_DATASET_PATH = "/home/dkuo/RetFound/tasks/referable_CFP_OCT/dataset/OCT"
-PEDS_OPTOS_DATASET_PATH = "/home/dkuo/RetFound/tasks/peds_optos/dataset"
+PEDS_OPTOS_DATASET_PATH = "/home/dkuo/RetFound/tasks/peds_optos/dataset" 
 
 RETFOUND_EXPECTED_IMAGE_SIZE = 224
 NUM_CLASSES = 2
@@ -66,7 +66,12 @@ class Trainer:
         # model, optimizer, loss
         self.gpu_id = int(os.environ["LOCAL_RANK"])
         self.model = model.to(self.gpu_id)
-        self.model = DDP(self.model, device_ids=[self.gpu_id])
+        self.model = DDP(
+            self.model, 
+            device_ids=[self.gpu_id],
+            gradient_as_bucket_view=True,
+            static_graph=False,
+        )
         self.grad_accum_steps = grad_accum_steps
         self.optimizer = optimizer
         self.scheduler = scheduler
@@ -123,20 +128,23 @@ class Trainer:
         self.optimizer.zero_grad()
         take_gradient_step = ((index + 1) % self.grad_accum_steps == 0) or ((index + 1) == len(self.train_dataloader))
         # Take gradient step only every self.grad_accum_steps steps or at the end of the epoch
+
+        # Sanity check: class balance (for resampling) - TODO: remove after check
+        print(f"[GPU{self.gpu_id}] Batch {index} | Class balance: {torch.bincount(targets)}")
         
         with torch.autocast(device_type='cuda', dtype=torch.float16) if self.mixed_precision else nullcontext():
             with self.model.no_sync() if not take_gradient_step else nullcontext():
                 outputs = self.model(inputs)  # (batch_size, num_classes)
-                loss = self.loss_fn(outputs, targets)
+                loss = self.loss_fn(outputs, targets) / self.grad_accum_steps
                 preds = torch.argmax(outputs, dim=-1)  # (batch_size)
                 train_acc = torch.sum(preds == targets) / len(targets)
-                # print(f"[GPU{self.gpu_id}] Training loss: {loss}, Training accuracy: {train_acc}")
+                print(f"[GPU{self.gpu_id}] Training loss: {loss}, Training accuracy: {train_acc}")
 
                 # avg across all GPUs and send to rank 0 process
                 torch.distributed.reduce(loss, op=torch.distributed.ReduceOp.AVG, dst=0)
                 torch.distributed.reduce(train_acc, op=torch.distributed.ReduceOp.AVG, dst=0)
                 if self.gpu_id == 0:
-                    # print(f"[MEAN] Training loss: {loss}, Training accuracy: {train_acc} \n")
+                    print(f"[MEAN] Training loss: {loss}, Training accuracy: {train_acc} \n")
                     wandb.log({"train_loss": loss, "train_acc": train_acc})
                 
                 self.scaler.scale(loss).backward() if self.mixed_precision else loss.backward()
@@ -198,8 +206,8 @@ class Trainer:
 
     def _train_epoch(self, epoch: int):
         """ Train for one epoch """
-        # batch_size = len(next(iter(self.train_dataloader))[0])
-        # print(f"\n[GPU{self.gpu_id}] Epoch {epoch} | Batch size {batch_size} | Steps: {len(self.train_dataloader)}")
+        batch_size = len(next(iter(self.train_dataloader))[0])
+        print(f"\n[GPU{self.gpu_id}] Epoch {epoch} | Batch size {batch_size} | Steps: {len(self.train_dataloader)}")
         self.train_dataloader.sampler.set_epoch(epoch)
         
         for index, batch in enumerate(self.train_dataloader):
@@ -210,6 +218,7 @@ class Trainer:
         
         if self.scheduler:
             self.scheduler.step()  # update learning rate every epoch if using LR scheduler (alternatively, update every step)
+            print(f"\n[GPU{self.gpu_id}] Epoch {epoch} | Updating learning rate: ", self.scheduler.get_last_lr())
 
     def train(self, max_epochs: int):
         """ Train for max_epochs """
@@ -425,7 +434,7 @@ def _setup_dataloader(dataset: Dataset, batch_size: int, sampler: torch.utils.da
         batch_size=batch_size,
         num_workers=4,
         pin_memory=True,
-        shuffle=False,  # no shuffling as we want to preserve the order of the images
+        shuffle=False,  # DistributedSampler will handle shuffling
         sampler=DistributedSampler(dataset) if sampler is None else sampler,  # for DDP
         collate_fn=collate_fn,
     )
@@ -501,6 +510,7 @@ def setup_model(
         model_arch: str, 
         modality: str, 
         training_strategy: str,
+        checkpoint_path: str = None,
         num_classes: int = 2, 
         global_pool: bool = False,
     ):
@@ -513,6 +523,8 @@ def setup_model(
         Modality: CFP, OCT
     training_strategy : str
         Training strategy: full_finetune, linear_probe
+    checkpoint_path : str, optional
+        Path to model checkpoint to finetune from, by default None
     num_classes : int, optional
         Number of classes, by default 2
     global_pool : bool, optional
@@ -541,7 +553,7 @@ def setup_model(
             global_pool=global_pool,
         )
         # load mae checkpoint
-        mae_checkpoint_path = OCT_CHKPT_PATH if modality == "OCT" else CFP_CHKPT_PATH
+        mae_checkpoint_path = checkpoint_path if checkpoint_path else (OCT_CHKPT_PATH if modality == "OCT" else CFP_CHKPT_PATH)
         print(f"Loading model from {mae_checkpoint_path}")
         mae_checkpoint = torch.load(mae_checkpoint_path, map_location='cpu')
         mae_checkpoint_model = mae_checkpoint["model"]
@@ -589,7 +601,7 @@ def setup_optimizer(
     model : torch.nn.Module
         Model to train
     algo : str
-        Optimization algorithm to use: adamw, lars
+        Optimization algorithm to use: adam, adamw, lars, lamb
     training_strategy : str
         Training strategy: full_finetune, linear_probe
     lr : float
@@ -621,7 +633,7 @@ def setup_optimizer(
     return optimizer
 
 
-def setup_lr_scheduler(optimizer: torch.optim.Optimizer, total_epochs: int, algorithm: str = None):
+def setup_lr_scheduler(optimizer: torch.optim.Optimizer, total_epochs: int, algorithm: str):
     """
     Parameters
     ----------
@@ -639,21 +651,26 @@ def setup_lr_scheduler(optimizer: torch.optim.Optimizer, total_epochs: int, algo
     """
     scheduler = None
     
-    warmup = torch.optim.lr_scheduler.LinearLR(optimizer, total_iters=5)
-    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs)
+    warmup = torch.optim.lr_scheduler.LinearLR(optimizer, total_iters=5, verbose=True)
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs, verbose=True)
 
+    if algorithm == "cosine":
+        scheduler = cosine
+    
     if algorithm == "cosine_linear_warmup":
         scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], milestones=[5])
     
     return scheduler
 
 
-def setup_loss_fn(modality: str = "none"):
+def setup_loss_fn(modality: str = "none", label_smoothing: float = 0.0):
     """
     Parameters
     ----------
     modality : str
         Modality: CFP, OCT, PEDS_OPTOS, none. If none, do not weight loss function.
+    label_smoothing : float, optional
+        Add uniformly distributed smoothing when computing the loss; range 0.0-1.0 where 0.0 means no smoothing, by default 0.0
 
     Returns
     -------
@@ -674,6 +691,7 @@ def setup_loss_fn(modality: str = "none"):
     }
     return torch.nn.CrossEntropyLoss(
         weight=class_weights[modality] if modality in class_weights else None,
+        label_smoothing=label_smoothing,
     )  
 
 
@@ -703,10 +721,10 @@ def main(args):
 
     # Set up training objects
     train_dataloader, val_dataloader, test_dataloader = setup_data(dataset_path, args.batch_size, args.seed, args.resample, args.dataset_size, args.augment)
-    model = setup_model(model_arch=args.model_arch, modality=args.modality, training_strategy=args.training_strategy)
+    model = setup_model(model_arch=args.model_arch, modality=args.modality, training_strategy=args.training_strategy, checkpoint_path=args.checkpoint_path, num_classes=NUM_CLASSES)
     optimizer = setup_optimizer(model, algo=args.optimizer, training_strategy=args.training_strategy, lr=args.learning_rate, weight_decay=args.weight_decay)
-    scheduler = setup_lr_scheduler(optimizer, args.total_epochs)
-    loss_fn = setup_loss_fn(args.modality if args.weight_loss_fn else "none")
+    scheduler = setup_lr_scheduler(optimizer, args.total_epochs, args.lr_scheduler)
+    loss_fn = setup_loss_fn(modality=args.modality if args.weight_loss_fn else "none", label_smoothing=args.label_smoothing)
 
     # Set up W&B logging 
     gpu_id = int(os.environ["LOCAL_RANK"])
@@ -714,7 +732,7 @@ def main(args):
         wandb.init(
             project=args.wandb_proj_name,
             config=args,
-            resume=False,  # continue logging from previous run if did not finish
+            resume=False,  # if True, continue logging from previous run if did not finish
         )
 
     # Set up trainer
@@ -765,11 +783,13 @@ if __name__ == "__main__":
     # Task parameters
     parser.add_argument('--modality', type=str, default="OCT", help='Must be OCT, CFP, or PEDS_OPTOS')
     parser.add_argument('--dataset_path', type=str, help='Path to root directory of PyTorch ImageFolder dataset')
+    parser.add_argument('--checkpoint_path', type=str, help='Path to model checkpoint to finetune from')
     parser.add_argument('--wandb_proj_name', default="retfound_referable_cfp_oct", type=str, help='Name of W&B project to log to')   
         
     # Data Hyperparameters
     parser.add_argument('--weight_loss_fn', action='store_true', help='Weight loss function to balance classes')
     parser.add_argument('--resample', action='store_true', help='Resample training data to balance classes')
+    parser.add_argument('--label_smoothing', type=float, default=0.0, help='Add uniformly distributed smoothing when computing the loss; range 0.0-1.0 where 0.0 means no smoothing')
     parser.add_argument('--dataset_size', type=int, help='Number of training images to train the model with.')  # CFP: 650, OCT: 914
     parser.add_argument('--augment', type=str, default="randaugment", help='Data augmentation strategy: none, trivialaugment, randaugment, autoaugment, augmix, deit3') 
     # parser.add_argument('--cutmixup', type=bool, default=False, help='Whether to use CutMix/MixUp data augmentation')  # TODO: add/fix cutmixup
@@ -785,7 +805,7 @@ if __name__ == "__main__":
     
     parser.add_argument('--optimizer', type=str, default="lars", help='Optimizer: adam, adamw, lars, lamb')
     parser.add_argument('--learning_rate', type=float, default=0.3, help='Learning rate')
-    parser.add_argument('--lr_scheduler', type=str, help='Learning rate scheduler: none, cosine_linear_warmup')  
+    parser.add_argument('--lr_scheduler', type=str, help='Learning rate scheduler: none, cosine, cosine_linear_warmup')  
     parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay')
     
     # parser.add_argument('--global_average_pooling', type=bool, default=False, help='Use global average pooling')  # TODO: debug
