@@ -124,8 +124,6 @@ class Trainer:
     
     def _train_batch(self, index: int, inputs: torch.Tensor, targets: torch.Tensor):
         """ Train on one batch """
-        self.model.train()
-        self.optimizer.zero_grad()
         take_gradient_step = ((index + 1) % self.grad_accum_steps == 0) or ((index + 1) == len(self.train_dataloader))
         # Take gradient step only every self.grad_accum_steps steps or at the end of the epoch
 
@@ -155,6 +153,7 @@ class Trainer:
                 self.scaler.update()
             else:
                 self.optimizer.step()
+            self.optimizer.zero_grad()
     
     def _validate(self, test: bool = False):
         """ Validate current model on validation or final test dataset"""
@@ -214,6 +213,9 @@ class Trainer:
             inputs, targets = batch
             inputs = inputs.to(self.gpu_id).to(memory_format=torch.channels_last)
             targets = targets.to(self.gpu_id)
+            
+            self.model.train()
+            self.optimizer.zero_grad()
             self._train_batch(index, inputs, targets)
         
         if self.scheduler:
