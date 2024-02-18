@@ -70,7 +70,7 @@ class Trainer:
             self.model, 
             device_ids=[self.gpu_id],
             gradient_as_bucket_view=True,
-            static_graph=False,
+            static_graph=False,  # errors when set to True
         )
         self.grad_accum_steps = grad_accum_steps
         self.optimizer = optimizer
@@ -616,8 +616,6 @@ def setup_optimizer(
     optimizer : torch.optim.Optimizer
         Optimizer for training
     """
-
-
     optimization_algorithms = {
         "adam": torch.optim.Adam,
         "adamw": torch.optim.AdamW,
@@ -635,7 +633,12 @@ def setup_optimizer(
     return optimizer
 
 
-def setup_lr_scheduler(optimizer: torch.optim.Optimizer, total_epochs: int, algorithm: str):
+def setup_lr_scheduler(
+    optimizer: torch.optim.Optimizer, 
+    total_epochs: int, 
+    algo: str,
+    warmup_epochs: int = 0,
+) -> torch.optim.lr_scheduler:
     """
     Parameters
     ----------
@@ -643,8 +646,10 @@ def setup_lr_scheduler(optimizer: torch.optim.Optimizer, total_epochs: int, algo
         Optimizer for training
     total_epochs : int
         Total number of epochs to train for
-    algorithm : str, optional
-        Learning rate scheduler algorithm: "cosine_linear_warmup", by default None
+    algo : str, optional
+        Learning rate scheduler algorithm: cosine, exponential
+    warmup_epochs : int
+        Number of epochs to do linear learning rate warmup
     
     Returns
     -------
@@ -652,16 +657,16 @@ def setup_lr_scheduler(optimizer: torch.optim.Optimizer, total_epochs: int, algo
         Learning rate scheduler
     """
     scheduler = None
-    
-    warmup = torch.optim.lr_scheduler.LinearLR(optimizer, total_iters=5, verbose=True)
-    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs, verbose=True)
-
-    if algorithm == "cosine":
-        scheduler = cosine
-    
-    if algorithm == "cosine_linear_warmup":
-        scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], milestones=[5])
-    
+    warmup = torch.optim.lr_scheduler.LinearLR(optimizer, total_iters=warmup_epochs, verbose=True)
+    scheduling_algorithms = {
+        "cosine": torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs, verbose=True),
+        "exponential": torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99, verbose=True)
+    }
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, 
+        [warmup, scheduling_algorithms[algo]], 
+        milestones=[warmup_epochs]
+    )
     return scheduler
 
 

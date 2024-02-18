@@ -32,7 +32,7 @@ from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
 import models_mae
 
-from engine_pretrain import train_one_epoch
+from mae_engine_pretrain import train_one_epoch
 
 
 def get_args_parser():
