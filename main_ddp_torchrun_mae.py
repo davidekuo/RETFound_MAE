@@ -86,18 +86,26 @@ class Trainer:
         """Load model and optimizer state from snapshot"""
         loc = f"cuda:{self.gpu_id}"
         snapshot = torch.load(snapshot_path, map_location=loc)
-        self.model.module.load_state_dict(snapshot["MODEL_STATE"])  # alternatively, use self.model.load_state_dict(...) but save self.model.state_dict() in _save_snapshot()
-        self.optimizer.load_state_dict(snapshot["OPTIMIZER_STATE"])
-        self.epochs_run = snapshot["EPOCHS_RUN"]
+        self.model.module.load_state_dict(snapshot["model"])  # alternatively, use self.model.load_state_dict(...) but save self.model.state_dict() in _save_snapshot()
+        self.optimizer.load_state_dict(snapshot["optimizer"])
+        self.epochs_run = snapshot["epoch"]
+        if self.scheduler is not None:
+            self.scheduler.load_state_dict(snapshot["scheduler"])
+        if self.mixed_precision:
+            self.scaler.load_state_dict(snapshot["scaler"])
         print(f"Resuming training from snapshot at Epoch {self.epochs_run}.")
     
     def _save_snapshot(self, epoch: int, snapshot_path: str):
         """Save model and optimizer state to snapshot"""
         snapshot = {
-            "MODEL_STATE": self.model.module.state_dict(),  # actual model is module wrapped by DDP
-            "OPTIMIZER_STATE": self.optimizer.state_dict(),
-            "EPOCHS_RUN": epoch,
+            "model": self.model.module.state_dict(),  # actual model is module wrapped by DDP
+            "optimizer": self.optimizer.state_dict(),
+            "epoch": epoch,
         }
+        if self.scheduler is not None:
+            snapshot["scheduler"] = self.scheduler.state_dict()
+        if self.mixed_precision:
+            snapshot["scaler"] = self.scaler.state_dict()
         torch.save(snapshot, snapshot_path)
         print(f"Epoch {epoch} | Saving snapshot to {snapshot_path}.")
     

@@ -105,20 +105,28 @@ class Trainer:
         """ Load snapshot of model """
         loc = f"cuda:{self.gpu_id}"
         snapshot = torch.load(snapshot_path, map_location=loc)
-        self.model.module.load_state_dict(snapshot["MODEL_STATE"])  # alternatively, use self.model.load_state_dict(...) but save self.model.state_dict() in _save_snapshot()
-        self.optimizer.load_state_dict(snapshot["OPTIMIZER_STATE"])
-        self.epochs_run = snapshot["EPOCHS_RUN"]
-        self.best_val_f1 = snapshot["BEST_VAL_F1"]
+        self.model.module.load_state_dict(snapshot["model"])  # alternatively, use self.model.load_state_dict(...) but save self.model.state_dict() in _save_snapshot()
+        self.optimizer.load_state_dict(snapshot["optimizer"])
+        self.epochs_run = snapshot["epoch"]
+        self.best_val_f1 = snapshot["best_val_f1"]
+        if self.scheduler is not None:
+            self.scheduler.load_state_dict(snapshot["scheduler"])
+        if self.mixed_precision:
+            self.scaler.load_state_dict(snapshot["scaler"]) 
         print(f"Successfully loaded snapshot from Epoch {self.epochs_run}. Best validation F1 so far: {self.best_val_f1}")
     
     def _save_snapshot(self, epoch: int, snapshot_path: str):
         """ Save snapshot of current model """
         snapshot = {
-            "MODEL_STATE": self.model.module.state_dict(),  # actual model is module wrapped by DDP
-            "OPTIMIZER_STATE": self.optimizer.state_dict(),
-            "EPOCHS_RUN": epoch,
-            "BEST_VAL_F1": self.best_val_f1,
+            "model": self.model.module.state_dict(),  # actual model is module wrapped by DDP
+            "optimizer": self.optimizer.state_dict(),
+            "epoch": epoch,
+            "best_val_f1": self.best_val_f1,
         }
+        if self.scheduler is not None:
+            snapshot["scheduler"] = self.scheduler.state_dict()    
+        if self.mixed_precision:
+            snapshot["scaler"] = self.scaler.state_dict()
         torch.save(snapshot, snapshot_path)
         # print(f"Epoch {epoch} | Training snapshot saved at {snapshot_path}")
     
@@ -340,6 +348,12 @@ def setup_ddp():
     """ Set up distributed data parallel (DDP) training """
     init_process_group(backend="nccl")
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+
+
+def set_seed_everywhere(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
 
 def _default_data_transform():
@@ -700,12 +714,6 @@ def setup_loss_fn(modality: str = "none", label_smoothing: float = 0.0):
         weight=class_weights[modality] if modality in class_weights else None,
         label_smoothing=label_smoothing,
     )  
-
-
-def set_seed_everywhere(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
 
 
 def main(args):
