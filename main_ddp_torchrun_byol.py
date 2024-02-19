@@ -8,7 +8,9 @@ import wandb
 
 from byol_pytorch import BYOL
 from contextlib import nullcontext
+from util.lars import LARS
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+from timm.optim import Lamb
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data.distributed import DistributedSampler
@@ -20,6 +22,7 @@ OCT_DATASET_PATH = "/home/dkuo/RetFound/tasks/referable_CFP_OCT/dataset/OCT"
 PEDS_OPTOS_DATASET_PATH = "/home/dkuo/RetFound/tasks/peds_optos/dataset" 
 
 RETFOUND_EXPECTED_IMAGE_SIZE = 224
+NUM_CLASSES = 2
 
 
 class Trainer:
@@ -28,6 +31,7 @@ class Trainer:
             model: torch.nn.Module,
             data_loader: torch.utils.data.DataLoader,
             optimizer: torch.optim.Optimizer,
+            scheduler: torch.optim.lr_scheduler,
             save_every: int,
             snapshot_path: str,
             grad_accum_steps: int,
@@ -43,9 +47,11 @@ class Trainer:
             device_ids=[self.gpu_id],
             find_unused_parameters=True,  # for gradient accumulation
             gradient_as_bucket_view=True,  # for faster DDP training (in theory)
+            static_graph=False,  # errors when set to True
         )
         self.dataloader = data_loader
         self.optimizer = optimizer
+        self.scheduler = scheduler
         self.grad_accum_steps = grad_accum_steps
         
         # mixed precision
@@ -57,25 +63,33 @@ class Trainer:
         self.save_every = save_every
         self.snapshot_path = snapshot_path
         if os.path.exists(self.snapshot_path):
-            print(f"Loading snapshot from {self.snapshot_file_path}")
-            self._load_snapshot(self.snapshot_file_path)
+            print(f"Loading snapshot from {self.snapshot_path}")
+            self._load_snapshot(self.snapshot_path)
     
     def _load_snapshot(self, snapshot_path: str) -> None:
         """Load model and optimizer state from snapshot"""
         loc = f"cuda:{self.gpu_id}"
         snapshot = torch.load(snapshot_path, map_location=loc)
-        self.model.module.load_state_dict(snapshot["MODEL_STATE"])
-        self.optimizer.load_state_dict(snapshot["OPTIMIZER_STATE"])
-        self.epochs_run = snapshot["EPOCHS_RUN"]
+        self.model.module.load_state_dict(snapshot["model"])
+        self.optimizer.load_state_dict(snapshot["optimizer"])
+        self.epochs_run = snapshot["epoch"]
+        if self.scheduler is not None:
+            self.scheduler.load_state_dict(snapshot["scheduler"])
+        if self.mixed_precision:
+            self.scaler.load_state_dict(snapshot["scaler"])
         print(f"Resuming training from snapshot at Epoch {self.epochs_run}.")
     
     def _save_snapshot(self, epoch: int, snapshot_path: str) -> None:
         """Save model and optimizer state to snapshot"""
         snapshot = {
-            "MODEL_STATE": self.model.module.state_dict(),  # actual model is module wrapped by DDP
-            "OPTIMIZER_STATE": self.optimizer.state_dict(),
-            "EPOCHS_RUN": self.epochs_run,
+            "model": self.model.module.state_dict(),  # actual model is module wrapped by DDP
+            "optimizer": self.optimizer.state_dict(),
+            "epoch": self.epochs_run,
         }
+        if self.scheduler is not None:
+            snapshot["scheduler"] = self.scheduler.state_dict()
+        if self.mixed_precision:
+            snapshot["scaler"] = self.scaler.state_dict()
         torch.save(snapshot, snapshot_path)
         print(f"Epoch {epoch} | Saving snapshot to {snapshot_path}.")
     
@@ -110,10 +124,86 @@ class Trainer:
                         self.optimizer.step()
                     self.optimizer.zero_grad()
             
+            if self.scheduler:
+                self.scheduler.step()  # update learning rate every epoch if using LR scheduler (alternatively, update every batch)
+            
             self.epochs_run += 1
             # print(f"[GPU{self.gpu_id}] Epoch {epoch} | Loss: {loss.item()}")  # TODO: print epoch loss
             if self.gpu_id == 0 and epoch % self.save_every == 0:
                 self._save_snapshot(epoch, self.snapshot_path)
+
+
+def setup_optimizer(
+        model: torch.nn.Module, 
+        algo: str,
+        lr: float, 
+        weight_decay: float
+    ):
+    """
+    Parameters
+    ----------
+    model : torch.nn.Module
+        Model to train
+    algo : str
+        Optimization algorithm to use: adam, adamw, lars, lamb
+    lr : float
+        Learning rate
+    weight_decay : float
+        Weight decay
+    
+    Returns
+    -------
+    optimizer : torch.optim.Optimizer
+        Optimizer for training
+    """
+    optimization_algorithms = {
+        "adam": torch.optim.Adam,
+        "adamw": torch.optim.AdamW,
+        "lars": LARS,
+        "lamb": Lamb,
+    }
+    assert algo in optimization_algorithms, f"Optimizer must be one of {list(optimization_algorithms.keys())}"
+    optim_algo = optimization_algorithms[algo]
+    optimizer = optim_algo(params=model.parameters(), lr=lr, weight_decay=weight_decay)
+    
+    return optimizer
+
+
+def setup_lr_scheduler(
+    optimizer: torch.optim.Optimizer, 
+    total_epochs: int, 
+    algo: str,
+    warmup_epochs: int = 0,
+) -> torch.optim.lr_scheduler:
+    """
+    Parameters
+    ----------
+    optimizer : torch.optim.Optimizer
+        Optimizer for training
+    total_epochs : int
+        Total number of epochs to train for
+    algo : str, optional
+        Learning rate scheduler algorithm: cosine, exponential
+    warmup_epochs : int
+        Number of epochs to do linear learning rate warmup
+    
+    Returns
+    -------
+    scheduler : torch.optim.lr_scheduler
+        Learning rate scheduler
+    """
+    scheduler = None
+    warmup = torch.optim.lr_scheduler.LinearLR(optimizer, total_iters=warmup_epochs, verbose=True)
+    scheduling_algorithms = {
+        "cosine": torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs, verbose=True),
+        "exponential": torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99, verbose=True)
+    }
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, 
+        [warmup, scheduling_algorithms[algo]], 
+        milestones=[warmup_epochs]
+    )
+    return scheduler
 
 
 def main(args):
@@ -131,17 +221,22 @@ def main(args):
     torch.backends.cudnn.benchmark = True  
 
     # Set up model
-    resnet50 = timm.create_model('resnet50.a1_in1k', pretrained=True, num_classes=2).to(gpu_id)
+    resnet50 = timm.create_model('resnet50.a1_in1k', pretrained=True, num_classes=NUM_CLASSES).to(gpu_id)
     model = BYOL(
         resnet50,
         image_size = RETFOUND_EXPECTED_IMAGE_SIZE,
         hidden_layer = 'global_pool',
-        use_momentum = True,
+        use_momentum = args.use_momentum,
     )
-    # Note: loss is returned in forward function of BYOL class
+    # NOTE: loss is returned in forward function of BYOL class
+    # NOTE: can access resnet50 as model.net
+    model = model.to(memory_format=torch.channels_last)  # for faster training with convolutional, pooling layers
 
-    # Set up optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    # Set up optimizer and (optional) LR scheduler
+    optimizer = setup_optimizer(model, args.optimizer, args.learning_rate, args.weight_decay)
+    print("Optimizer: ", optimizer)
+    scheduler = setup_lr_scheduler(optimizer, args.total_epochs, args.lr_scheduler, args.warmup_epochs) if args.lr_scheduler else None
+    print("Scheduler: ", scheduler)
 
     # Set up data/dataloaders - no augmentations needed
     transform = transforms.Compose([
@@ -166,7 +261,7 @@ def main(args):
         wandb.init(
             project=args.wandb_proj_name,
             config=args,
-            resume=True,
+            resume=False,  # if True, continue logging from previous run if did not finish
         )
 
     # Train
@@ -174,6 +269,7 @@ def main(args):
         model=model,
         data_loader=dataloader,
         optimizer=optimizer,
+        scheduler=scheduler,
         save_every=args.save_every,
         snapshot_path=args.snapshot_path,
         grad_accum_steps=args.grad_accum_steps,
@@ -181,11 +277,12 @@ def main(args):
     )
     trainer.train(args.total_epochs)
 
-    # If training finished successfully, rename model snapshot to [wandb_run_name].pth
+    # If training finished successfully, save final ResNet50 model to byol_[wandb_run_name].pth and remove byol.pth
     if gpu_id == 0:
-        print(f"\nTraining completed successfully! Renaming byol.pth as {wandb.run.name}.pth\n")
+        print(f"\nTraining completed successfully! Saving final ResNet50 model as byol_{wandb.run.name}.pth\n")
+        torch.save(resnet50, args.snapshot_path.replace("byol.pth", f"byol_{wandb.run.name}.pth"))
         if os.path.exists(args.snapshot_path):
-            os.rename(args.snapshot_path, args.snapshot_path.replace("byol.pth", f"{wandb.run.name}.pth"))
+            os.remove(args.snapshot_path)
 
     # Clean up
     wandb.finish()
@@ -194,24 +291,36 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--wandb_proj_name', default="retfound_referable_cfp_oct", type=str, help='Name of W&B project to log to')
+    
+    # Random seed
     parser.add_argument('--seed', type=int, default=0, help='Random seed')
     
+    # Task & data parameters
+    parser.add_argument('--wandb_proj_name', default="retfound_referable_cfp_oct", type=str, help='Name of W&B project to log to')
     parser.add_argument('--dataset_path', type=str, 
                         default="/home/dkuo/RetFound/tasks/referable_CFP_OCT/dataset/CFP",
                         help='Path to root directory of PyTorch ImageFolder dataset')
                         # CFP: "/home/dkuo/RetFound/tasks/referable_CFP_OCT/dataset/CFP"
                         # OPTOS: "/home/dkuo/RetFound/tasks/peds_optos/dataset"
-    parser.add_argument('--snapshot_path', type=str, 
-                        default="/home/dkuo/RetFound/tasks/referable_CFP_OCT/snapshots/byol.pth",
-                        help='Path to save training snapshots to')
-    parser.add_argument('--save_every', type=int, default=1, help='Save snapshot every _ epochs')
     
+    # Training parameters
+    parser.add_argument('--use_momentum', type=bool, default=True, help='True: BYOL, False: SimSiam')
     parser.add_argument('--total_epochs', type=int, default=10, help='Total epochs to train the model')
-    parser.add_argument('--learning_rate', type=float, default=3e-4, help='Learning rate')
     parser.add_argument('--batch_size', type=int, default=128, help='Input batch size on each device')  # max batch_size with ResNet-50, AMP is 128
     parser.add_argument('--grad_accum_steps', type=int, default=1, help='Number of gradient accumulation steps before performing optimizer step. Effective batch size becomes batch_size * gradient_accumulation_steps * num_gpus')
     parser.add_argument('--mixed_precision', type=bool, default=True, help='Use automatic mixed precision')
+    
+    parser.add_argument('--optimizer', type=str, default="adamw", help='Optimizer: adam, adamw, lars, lamb')
+    parser.add_argument('--learning_rate', type=float, default=3e-4, help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay')
+    parser.add_argument('--lr_scheduler', type=str, help='Learning rate scheduler: cosine, exponential, plateau')  
+    parser.add_argument('--warmup_epochs', type=int, default=5, help='epochs to warm up LR')
+
+    # Snapshot/checkpointing parameters
+    parser.add_argument('--save_every', type=int, default=1, help='Save snapshot every _ epochs')
+    parser.add_argument('--snapshot_path', type=str, 
+                        default="/home/dkuo/RetFound/tasks/referable_CFP_OCT/snapshots/byol.pth",
+                        help='Path to save training snapshots to')
     
     args = parser.parse_args()
     main(args)
