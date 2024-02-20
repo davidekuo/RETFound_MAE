@@ -557,10 +557,18 @@ def setup_model(
     if model_arch == "resnet50":
         print("Setting up timm model: resnet50.a1_in1k")
         model = timm.create_model('resnet50.a1_in1k', pretrained=True, num_classes=num_classes)
+        if checkpoint_path is not None:
+            print(f"Loading model weights from {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            model.load_state_dict(checkpoint['model'], strict=True) 
     
     elif model_arch == "vit_large":
         print("Setting up timm model: vit_large_patch16_224.augreg_in21k_ft_in1k")
         model = timm.create_model('vit_large_patch16_224.augreg_in21k_ft_in1k', pretrained=True, num_classes=num_classes)
+        if checkpoint_path is not None:
+            print(f"Loading model weights from {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            model.load_state_dict(checkpoint['model'], strict=True)
     
     else:  # model_arch == "retfound" 
         print("Setting up RetFound model")
@@ -570,7 +578,7 @@ def setup_model(
         )
         # load mae checkpoint
         mae_checkpoint_path = checkpoint_path if checkpoint_path else (OCT_CHKPT_PATH if modality == "OCT" else CFP_CHKPT_PATH)
-        print(f"Loading model from {mae_checkpoint_path}")
+        print(f"Loading model weights from {mae_checkpoint_path}")
         mae_checkpoint = torch.load(mae_checkpoint_path, map_location='cpu')
         mae_checkpoint_model = mae_checkpoint["model"]
         state_dict = model.state_dict()
@@ -738,7 +746,7 @@ def main(args):
     train_dataloader, val_dataloader, test_dataloader = setup_data(dataset_path, args.batch_size, args.seed, args.resample, args.dataset_size, args.augment)
     model = setup_model(model_arch=args.model_arch, modality=args.modality, training_strategy=args.training_strategy, checkpoint_path=args.checkpoint_path, num_classes=NUM_CLASSES)
     optimizer = setup_optimizer(model, algo=args.optimizer, training_strategy=args.training_strategy, lr=args.learning_rate, weight_decay=args.weight_decay)
-    scheduler = setup_lr_scheduler(optimizer, args.total_epochs, args.lr_scheduler)
+    scheduler = setup_lr_scheduler(optimizer, args.total_epochs, args.lr_scheduler, args.warmup_epochs) if args.lr_scheduler else None
     loss_fn = setup_loss_fn(modality=args.modality if args.weight_loss_fn else "none", label_smoothing=args.label_smoothing)
 
     # Set up W&B logging 
@@ -820,7 +828,8 @@ if __name__ == "__main__":
     
     parser.add_argument('--optimizer', type=str, default="lars", help='Optimizer: adam, adamw, lars, lamb')
     parser.add_argument('--learning_rate', type=float, default=0.3, help='Learning rate')
-    parser.add_argument('--lr_scheduler', type=str, help='Learning rate scheduler: none, cosine, cosine_linear_warmup')  
+    parser.add_argument('--lr_scheduler', type=str, help='Learning rate scheduler: cosine, exponential')  
+    parser.add_argument('--warmup_epochs', type=int, default=5, help='epochs to warm up LR')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay')
     
     # parser.add_argument('--global_average_pooling', type=bool, default=False, help='Use global average pooling')  # TODO: debug
