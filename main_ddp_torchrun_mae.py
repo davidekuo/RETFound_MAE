@@ -346,18 +346,18 @@ if __name__ == "__main__":
     # Training & model parameters
     parser.add_argument('--norm_pix_loss', type=bool, default=True, help='Use (per-patch) normalized pixels as targets for computing loss')
     parser.add_argument('--mixed_precision', type=bool, default=True, help='Use automatic mixed precision')
-    parser.add_argument('--model_arch', type=str, default="retfound", help='Model architecture: vit_large, retfound')
+    parser.add_argument('--model_arch', type=str, default="vit_large", help='Model architecture: vit_large, retfound')
     
-    parser.add_argument('--batch_size', type=int, default=64, help='Input batch size on each device')  # max batch_size with AMP {full_finetune: 64, linear_probe: 1024+}
+    parser.add_argument('--batch_size', type=int, default=128, help='Input batch size on each device')  # max 128 with AMP
     parser.add_argument('--grad_accum_steps', type=int, default=1, help='Number of gradient accumulation steps before performing optimizer step. Effective batch size becomes batch_size * gradient_accumulation_steps * num_gpus')
-    parser.add_argument('--total_epochs', type=int, default=30, help='Total epochs to train the model')
+    parser.add_argument('--total_epochs', type=int, default=50, help='Total epochs to train the model')
     
     # Optimizer & scheduler parameters
     parser.add_argument('--optimizer', type=str, default="adamw", help='Optimizer: adam, adamw, lars, lamb')
     parser.add_argument('--learning_rate', type=float, default=3e-4, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay')
     parser.add_argument('--lr_scheduler', type=str, help='Learning rate scheduler: cosine, exponential, plateau')  
-    parser.add_argument('--warmup_epochs', type=int, default=5, help='epochs to warm up LR')
+    parser.add_argument('--warmup_epochs', type=int, default=10, help='epochs to warm up LR')
 
     # Checkpointing parameters
     parser.add_argument('--save_every', type=int, default=1, help='Save a snapshot every _ epochs')

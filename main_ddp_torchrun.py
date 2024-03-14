@@ -135,7 +135,7 @@ class Trainer:
         take_gradient_step = ((index + 1) % self.grad_accum_steps == 0) or ((index + 1) == len(self.train_dataloader))
         # Take gradient step only every self.grad_accum_steps steps or at the end of the epoch
 
-        # Sanity check: class balance (for resampling) - TODO: remove after check
+        # Sanity check: class balance (for resampling)
         print(f"[GPU{self.gpu_id}] Batch {index} | Class balance: {torch.bincount(targets)}")
         
         with torch.autocast(device_type='cuda', dtype=torch.float16) if self.mixed_precision else nullcontext():
@@ -223,7 +223,6 @@ class Trainer:
             targets = targets.to(self.gpu_id)
             
             self.model.train()
-            self.optimizer.zero_grad()
             self._train_batch(index, inputs, targets)
         
         if self.scheduler:
@@ -354,6 +353,9 @@ def set_seed_everywhere(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False  # True gives faster training for fixed input size but nondeterministic
+    os.environ['PYTHONHASHSEED'] = str(seed)
 
 
 def _default_data_transform():
@@ -559,8 +561,8 @@ def setup_model(
         model = timm.create_model('resnet50.a1_in1k', pretrained=True, num_classes=num_classes)
         if checkpoint_path is not None:
             print(f"Loading model weights from {checkpoint_path}")
-            checkpoint = torch.load(checkpoint_path, map_location='cpu')
-            model.load_state_dict(checkpoint['model'], strict=True) 
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')  # timm model checkpoints are nn.Module objects
+            model.load_state_dict(checkpoint.state_dict(), strict=True) 
     
     elif model_arch == "vit_large":
         print("Setting up timm model: vit_large_patch16_224.augreg_in21k_ft_in1k")
@@ -568,8 +570,20 @@ def setup_model(
         if checkpoint_path is not None:
             print(f"Loading model weights from {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path, map_location='cpu')
-            model.load_state_dict(checkpoint['model'], strict=True)
-    
+            checkpoint_model = checkpoint["model"]
+            state_dict = model.state_dict()
+            # adapt checkpoint model to vit model
+            for k in ["head.weight", "head.bias"]:
+                if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
+                    print(f"Removing key {k} from checkpoint due to shape mismatch")
+                    del checkpoint_model[k]
+            # interpolate position embedding following DeiT
+            interpolate_pos_embed(model, checkpoint_model)
+            # load adapted checkpoint model state
+            msg = model.load_state_dict(checkpoint_model, strict=False)
+            # manually initialize head fc layer following MoCo v3
+            trunc_normal_(model.head.weight, std=.02)
+
     else:  # model_arch == "retfound" 
         print("Setting up RetFound model")
         model = models_vit.__dict__['vit_large_patch16'](
@@ -590,7 +604,7 @@ def setup_model(
         # interpolate position embedding following DeiT
         interpolate_pos_embed(model, mae_checkpoint_model)
         # load mae model state
-        msg = model.load_state_dict(mae_checkpoint['model'], strict=False)
+        msg = model.load_state_dict(mae_checkpoint_model, strict=False)
         # print(msg)
         if global_pool:
             assert set(msg.missing_keys) == {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}
@@ -727,7 +741,6 @@ def setup_loss_fn(modality: str = "none", label_smoothing: float = 0.0):
 def main(args):
     setup_ddp()
     set_seed_everywhere(args.seed)
-    torch.backends.cudnn.benchmark = True  # for faster training, requires fixed input size
 
     # Set up correct dataset paths for modality
     dataset_paths = {
@@ -829,7 +842,7 @@ if __name__ == "__main__":
     parser.add_argument('--optimizer', type=str, default="lars", help='Optimizer: adam, adamw, lars, lamb')
     parser.add_argument('--learning_rate', type=float, default=0.3, help='Learning rate')
     parser.add_argument('--lr_scheduler', type=str, help='Learning rate scheduler: cosine, exponential')  
-    parser.add_argument('--warmup_epochs', type=int, default=5, help='epochs to warm up LR')
+    parser.add_argument('--warmup_epochs', type=int, default=0, help='epochs to warm up LR')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay')
     
     # parser.add_argument('--global_average_pooling', type=bool, default=False, help='Use global average pooling')  # TODO: debug

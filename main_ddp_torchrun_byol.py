@@ -206,6 +206,15 @@ def setup_lr_scheduler(
     return scheduler
 
 
+def set_seed_everywhere(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False  # True gives faster training for fixed input size but nondeterministic
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
+
 def main(args):
     # Set up DDP
     init_process_group(backend="nccl")
@@ -213,12 +222,7 @@ def main(args):
     gpu_id = int(os.environ["LOCAL_RANK"])
 
     # Set seed
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-
-    # For faster training, requires fixed input size
-    torch.backends.cudnn.benchmark = True  
+    set_seed_everywhere(args.seed)
 
     # Set up model
     resnet50 = timm.create_model('resnet50.a1_in1k', pretrained=True, num_classes=NUM_CLASSES).to(gpu_id)
