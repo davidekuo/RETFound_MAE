@@ -32,6 +32,7 @@ from timm.models.layers import trunc_normal_
 import models_vit
 from util.lars import LARS
 from util.pos_embed import interpolate_pos_embed
+from util.sam import SAM, disable_running_stats, enable_running_stats
 
 
 CFP_CHKPT_PATH = "/home/dkuo/RetFound/model_checkpoints/RETFound_cfp_weights.pth"
@@ -135,7 +136,7 @@ class Trainer:
         take_gradient_step = ((index + 1) % self.grad_accum_steps == 0) or ((index + 1) == len(self.train_dataloader))
         # Take gradient step only every self.grad_accum_steps steps or at the end of the epoch
 
-        # Sanity check: class balance (for resampling)
+        # Check class balance (for resampling)
         print(f"[GPU{self.gpu_id}] Batch {index} | Class balance: {torch.bincount(targets)}")
         
         with torch.autocast(device_type='cuda', dtype=torch.float16) if self.mixed_precision else nullcontext():
@@ -163,6 +164,40 @@ class Trainer:
                 self.optimizer.step()
             self.optimizer.zero_grad()
     
+    def _train_sam_batch(self, index: int, inputs: torch.Tensor, targets: torch.Tensor):
+        """ 
+        Train on one batch with SAM optimizer (Sharpness-Aware Minimization) which takes 2 forward-backward passes 
+        NOTE: no gradient accumulation or mixed precision with SAM optimizer
+        """
+        # Check class balance (for resampling)
+        print(f"[GPU{self.gpu_id}] Batch {index} | Class balance: {torch.bincount(targets)}")
+        
+        # first forward-backward pass
+        enable_running_stats(self.model)  # compute running stats for batchnorm only in 1st pass
+        with self.model.no_sync():  # do not sync 1st pass gradients across GPUs
+            outputs = self.model(inputs)  # (batch_size, num_classes)
+            loss = self.loss_fn(outputs, targets)
+            preds = torch.argmax(outputs, dim=-1)  # (batch_size)
+            train_acc = torch.sum(preds == targets) / len(targets)
+            print(f"[GPU{self.gpu_id}] Training loss: {loss}, Training accuracy: {train_acc}")
+
+            # avg loss and accuracy across all GPUs and send to rank 0 process
+            torch.distributed.reduce(loss, op=torch.distributed.ReduceOp.AVG, dst=0)
+            torch.distributed.reduce(train_acc, op=torch.distributed.ReduceOp.AVG, dst=0)
+            if self.gpu_id == 0:
+                print(f"[MEAN] Training loss: {loss}, Training accuracy: {train_acc} \n")
+                wandb.log({"train_loss": loss, "train_acc": train_acc})
+            
+            loss.backward()
+            self.sam_optimizer.first_step(zero_grad=True)
+        
+        # second forward-backward pass
+        disable_running_stats(self.model) # don't compute running stats for batchnorm in 2nd pass
+        outputs = self.model(inputs)  # (batch_size, num_classes)
+        loss = self.loss_fn(outputs, targets)
+        loss.backward()
+        self.optimizer.second_step(zero_grad=True)
+
     def _validate(self, test: bool = False):
         """ Validate current model on validation or final test dataset"""
         metrics_dict = {"avg_loss": torch.tensor([0.0]).to(self.gpu_id)}
