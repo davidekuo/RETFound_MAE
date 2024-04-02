@@ -18,7 +18,7 @@ import torch
 from torch.distributed import init_process_group, destroy_process_group
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 import torchmetrics.classification as metrics
 from torchvision import datasets, transforms
@@ -167,7 +167,7 @@ class Trainer:
     def _train_sam_batch(self, index: int, inputs: torch.Tensor, targets: torch.Tensor):
         """ 
         Train on one batch with SAM optimizer (Sharpness-Aware Minimization) which takes 2 forward-backward passes 
-        NOTE: no gradient accumulation or mixed precision with SAM optimizer
+        NOTE: NO GRADIENT ACCUMULATION OR MIXED PRECISION WITH SAM OPTIMIZER!
         """
         # Check class balance (for resampling)
         print(f"[GPU{self.gpu_id}] Batch {index} | Class balance: {torch.bincount(targets)}")
@@ -530,7 +530,7 @@ def setup_data(dataset_path: str, batch_size: int, random_seed: int, resample: b
     if dataset_size:
         indices = torch.randperm(len(train_dataset))[:dataset_size]
         print(indices)
-        train_dataset = torch.utils.data.Subset(train_dataset, indices)
+        train_dataset = Subset(train_dataset, indices)
 
     # If specified, resample training dataset to balance classes with WeightedRandomSampler and wrap with DistributedSamplerWrapper for DDP
     # https://discuss.pytorch.org/t/how-to-handle-imbalanced-classes/11264
@@ -575,7 +575,7 @@ def setup_model(
     modality : str
         Modality: CFP, OCT
     training_strategy : str
-        Training strategy: full_finetune, linear_probe
+        Training strategy: full_finetune, linear_probe, surgical_finetune, sft_and_lp
     checkpoint_path : str, optional
         Path to model checkpoint to finetune from, by default None
     num_classes : int, optional
@@ -589,7 +589,7 @@ def setup_model(
         Model to train
     """
     assert model_arch in ["resnet50", "vit_large", "retfound"], "Model architecture must be resnet50, vit_large, or retfound"
-    assert args.training_strategy in ["full_finetune", "linear_probe"], "Training strategy must be full_finetune, or linear_probe"
+    assert args.training_strategy in ["full_finetune", "linear_probe, surgical_finetune, sft_and_lp"], "Training strategy must be full_finetune, linear_probe, surgical_finetune, or sft_and_lp"
 
     if model_arch == "resnet50":
         print("Setting up timm model: resnet50.a1_in1k")
@@ -602,20 +602,25 @@ def setup_model(
     elif model_arch == "vit_large":
         print("Setting up timm model: vit_large_patch16_224.augreg_in21k_ft_in1k")
         model = timm.create_model('vit_large_patch16_224.augreg_in21k_ft_in1k', pretrained=True, num_classes=num_classes)
+        
         if checkpoint_path is not None:
             print(f"Loading model weights from {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path, map_location='cpu')
             checkpoint_model = checkpoint["model"]
             state_dict = model.state_dict()
+            
             # adapt checkpoint model to vit model
             for k in ["head.weight", "head.bias"]:
                 if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
                     print(f"Removing key {k} from checkpoint due to shape mismatch")
                     del checkpoint_model[k]
+            
             # interpolate position embedding following DeiT
             interpolate_pos_embed(model, checkpoint_model)
+            
             # load adapted checkpoint model state
             msg = model.load_state_dict(checkpoint_model, strict=False)
+            
             # manually initialize head fc layer following MoCo v3
             trunc_normal_(model.head.weight, std=.02)
 
@@ -625,19 +630,23 @@ def setup_model(
             num_classes=num_classes,
             global_pool=global_pool,
         )
+        
         # load mae checkpoint
         mae_checkpoint_path = checkpoint_path if checkpoint_path else (OCT_CHKPT_PATH if modality == "OCT" else CFP_CHKPT_PATH)
         print(f"Loading model weights from {mae_checkpoint_path}")
         mae_checkpoint = torch.load(mae_checkpoint_path, map_location='cpu')
         mae_checkpoint_model = mae_checkpoint["model"]
         state_dict = model.state_dict()
+        
         # adapt mae model to vit model
         for k in ["head.weight", "head.bias"]:
             if k in mae_checkpoint_model and mae_checkpoint_model[k].shape != state_dict[k].shape:
                 print(f"Removing key {k} from checkpoint due to shape mismatch")
                 del mae_checkpoint_model[k]
+        
         # interpolate position embedding following DeiT
         interpolate_pos_embed(model, mae_checkpoint_model)
+        
         # load mae model state
         msg = model.load_state_dict(mae_checkpoint_model, strict=False)
         # print(msg)
@@ -645,9 +654,11 @@ def setup_model(
             assert set(msg.missing_keys) == {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}
         else:
             assert set(msg.missing_keys) == {"head.weight", "head.bias"}
+       
         # manually initialize head fc layer following MoCo v3
         trunc_normal_(model.head.weight, std=.02)
-        # set up linear probing if needed
+
+        # linear probing - freeze all parameters but the head
         if training_strategy == "linear_probe":
             # hack for linear probe: revise model head with batchnorm
             model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), model.head)
@@ -656,6 +667,25 @@ def setup_model(
                 param.requires_grad = False
             for name, param in model.head.named_parameters():
                 param.requires_grad = True
+        
+        # surgical fine-tuning for input-level shift
+        # freeze all parameters but embedding layer (patch_embed, pos_embed)
+        if training_strategy == "surgical_finetune":
+            for name, param in model.named_parameters():
+                param.requires_grad = False
+            for name, param in model.patch_embed.named_parameters():
+                param.requires_grad = True
+            model.pos_embed.requires_grad = True
+        
+        if training_strategy == "sft_and_lp":
+            # freeze all parameters but the head and embedding layers
+            for name, param in model.named_parameters():
+                param.requires_grad = False
+            for name, param in model.head.named_parameters():
+                param.requires_grad = True
+            for name, param in model.patch_embed.named_parameters():
+                param.requires_grad = True
+            model.pos_embed.requires_grad = True
     
     model = model.to(memory_format=torch.channels_last)  # for faster training with convolutional, pooling layers
     return model
@@ -695,12 +725,7 @@ def setup_optimizer(
     }
     assert algo in optimization_algorithms, f"Optimizer must be one of {list(optimization_algorithms.keys())}"
     optim_algo = optimization_algorithms[algo]
-
-    if training_strategy == "linear_probe":
-        optimizer = optim_algo(params=model.head.parameters(), lr=lr, weight_decay=weight_decay)
-    else:  # training_strategy == "full_finetune"
-        optimizer = optim_algo(params=model.parameters(), lr=lr, weight_decay=weight_decay)
-    
+    optimizer = optim_algo(params=model.parameters(), lr=lr, weight_decay=weight_decay)
     return optimizer
 
 
@@ -866,8 +891,8 @@ if __name__ == "__main__":
     # parser.add_argument('--cutmixup', type=bool, default=False, help='Whether to use CutMix/MixUp data augmentation')  # TODO: add/fix cutmixup
     
     # Training Hyperparameters
-    parser.add_argument('--training_strategy', type=str, default="full_finetune", help="Training strategy: full_finetune")  # TODO: add surgical fine-tuning, ...
-    parser.add_argument('--mixed_precision', type=bool, default=True, help='Use automatic mixed precision')
+    parser.add_argument('--training_strategy', type=str, default="full_finetune", help="Training strategy: full_finetune, linear_probe, surgical_finetune, sft_and_lp")  
+    parser.add_argument('--mixed_precision', action='store_true', help='Use automatic mixed precision')
     parser.add_argument('--model_arch', type=str, default="retfound", help='Model architecture: resnet50, vit_large, retfound')
     
     parser.add_argument('--batch_size', type=int, default=64, help='Input batch size on each device')  # max batch_size with AMP {full_finetune: 64, linear_probe: 1024+}
