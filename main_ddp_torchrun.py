@@ -7,11 +7,11 @@
 
 import argparse
 from contextlib import nullcontext
-import os
-from operator import itemgetter
-from typing import Optional
-import random
 import numpy as np
+from operator import itemgetter
+import os
+import random
+from typing import Optional
 import wandb
 
 import torch
@@ -25,9 +25,13 @@ from torchvision import datasets, transforms
 # import torchvision.transforms.v2 as transforms_v2
 
 import timm
-from timm.optim import Lamb
+from timm.data.auto_augment import rand_augment_transform
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.models.layers import trunc_normal_
+from timm.optim import Lamb
+from timm.scheduler.cosine_lr import CosineLRScheduler
+from timm.scheduler.poly_lr import PolyLRScheduler
+from timm.scheduler.step_lr import StepLRScheduler
 
 import models_vit
 from util.lars import LARS
@@ -261,8 +265,8 @@ class Trainer:
             self._train_batch(index, inputs, targets)
         
         if self.scheduler:
-            self.scheduler.step()  # update learning rate every epoch if using LR scheduler (alternatively, update every step)
-            print(f"\n[GPU{self.gpu_id}] Epoch {epoch} | Updating learning rate: ", self.scheduler.get_last_lr())
+            self.scheduler.step(epoch + 1)  # update learning rate every epoch if using LR scheduler (alternatively, update every step)
+            print(f"\n[GPU{self.gpu_id}] Epoch {epoch + 1} | Updating learning rate: ", self.scheduler._get_lr(epoch + 1))
 
     def train(self, max_epochs: int):
         """ Train for max_epochs """
@@ -396,9 +400,11 @@ def set_seed_everywhere(seed: int):
 def _default_data_transform():
     """ Return default data transforms (based on ImageNet dataset) - for val and test datasets """
     return transforms.Compose([
-        transforms.Resize(RETFOUND_EXPECTED_IMAGE_SIZE, 
-                          interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(RETFOUND_EXPECTED_IMAGE_SIZE),  # or Resize([224, 224])? 
+        transforms.Resize(
+            (RETFOUND_EXPECTED_IMAGE_SIZE, RETFOUND_EXPECTED_IMAGE_SIZE),
+            interpolation=transforms.InterpolationMode.BICUBIC
+        ),
+        # transforms.CenterCrop(RETFOUND_EXPECTED_IMAGE_SIZE), 
         transforms.ToTensor(),
         transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
     ])
@@ -426,9 +432,19 @@ def _augment_data_transform(augment: str):
         transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
     ])
 
+    """
+    # timm randaugment
+    augmentations = {
+        "randaugment": rand_augment_transform(
+            config_string=f"rand-m10-n4-mstd0.5",
+            hparams=None,
+        )
+    }
+    """
+
     augmentations = {
         "trivialaugment": transforms.TrivialAugmentWide(),
-        "randaugment": transforms.RandAugment(num_ops=4),
+        "randaugment": transforms.RandAugment(num_ops=4, magnitude=12),
         "autoaugment": transforms.AutoAugment(),
         "augmix": transforms.AugMix(),
         "deit3": deit3_transforms,
@@ -565,7 +581,14 @@ def setup_model(
         training_strategy: str,
         checkpoint_path: str = None,
         num_classes: int = 2, 
+        input_size: int = 224,
         global_pool: bool = False,
+        stochastic_depth_rate: float = 0.0,
+        patch_dropout_rate: float = 0.0,
+        position_embedding_dropout_rate: float = 0.0,     
+        attention_dropout_rate: float = 0.0,
+        projection_dropout_rate: float = 0.0, 
+        head_dropout_rate: float = 0.0
     ):
     """
     Parameters
@@ -580,8 +603,22 @@ def setup_model(
         Path to model checkpoint to finetune from, by default None
     num_classes : int, optional
         Number of classes, by default 2
+    input_size : int, optional
+        Input image size, by default 224
     global_pool : bool, optional
         Whether to use global average pooling, by default False
+    stochastic_depth_rate : float, optional
+        Stochastic depth rate for ViT, by default 0.0
+    patch_dropout_rate : float, optional
+        Patch dropout rate for ViT, by default 0.0
+    position_embedding_dropout_rate : float, optional
+        Position embedding dropout rate for ViT, by default 0.0
+    attention_dropout_rate : float, optional
+        Attention dropout rate for ViT, by default 0.0
+    projection_dropout_rate : float, optional
+        Projection layer dropout rate for ViT, by default 0.0
+    head_dropout_rate : float, optional
+        Classification head dropout rate for ViT, by default 0.0
     
     Returns
     -------
@@ -589,11 +626,15 @@ def setup_model(
         Model to train
     """
     assert model_arch in ["resnet50", "vit_large", "retfound"], "Model architecture must be resnet50, vit_large, or retfound"
-    assert args.training_strategy in ["full_finetune", "linear_probe, surgical_finetune, sft_and_lp"], "Training strategy must be full_finetune, linear_probe, surgical_finetune, or sft_and_lp"
+    assert args.training_strategy in ["full_finetune", "linear_probe", "surgical_finetune", "sft_and_lp"], "Training strategy must be full_finetune, linear_probe, surgical_finetune, or sft_and_lp"
 
     if model_arch == "resnet50":
         print("Setting up timm model: resnet50.a1_in1k")
-        model = timm.create_model('resnet50.a1_in1k', pretrained=True, num_classes=num_classes)
+        model = timm.create_model(
+            'resnet50.a1_in1k', 
+            pretrained=True, 
+            num_classes=num_classes
+        )
         if checkpoint_path is not None:
             print(f"Loading model weights from {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path, map_location='cpu')  # timm model checkpoints are nn.Module objects
@@ -601,7 +642,18 @@ def setup_model(
     
     elif model_arch == "vit_large":
         print("Setting up timm model: vit_large_patch16_224.augreg_in21k_ft_in1k")
-        model = timm.create_model('vit_large_patch16_224.augreg_in21k_ft_in1k', pretrained=True, num_classes=num_classes)
+        model = timm.create_model(
+            'vit_large_patch16_224.augreg_in21k_ft_in1k', 
+            pretrained=True, 
+            num_classes=num_classes,
+            img_size=input_size,
+            drop_path_rate=stochastic_depth_rate,
+            patch_drop_rate=patch_dropout_rate,
+            drop_rate=head_dropout_rate,
+            pos_drop_rate=position_embedding_dropout_rate,
+            attn_drop_rate=attention_dropout_rate,
+            proj_drop_rate=projection_dropout_rate,                          
+        )
         
         if checkpoint_path is not None:
             print(f"Loading model weights from {checkpoint_path}")
@@ -628,7 +680,14 @@ def setup_model(
         print("Setting up RetFound model")
         model = models_vit.__dict__['vit_large_patch16'](
             num_classes=num_classes,
+            img_size=input_size,
             global_pool=global_pool,
+            drop_path_rate=stochastic_depth_rate,
+            patch_drop_rate=patch_dropout_rate,
+            drop_rate=head_dropout_rate,
+            pos_drop_rate=position_embedding_dropout_rate,
+            attn_drop_rate=attention_dropout_rate,
+            proj_drop_rate=projection_dropout_rate,
         )
         
         # load mae checkpoint
@@ -733,7 +792,8 @@ def setup_lr_scheduler(
     optimizer: torch.optim.Optimizer, 
     total_epochs: int, 
     algo: str,
-    warmup_epochs: int = 0,
+    num_warmup_epochs: int,
+    warmup_init_lr: float = 0,
 ) -> torch.optim.lr_scheduler:
     """
     Parameters
@@ -743,7 +803,7 @@ def setup_lr_scheduler(
     total_epochs : int
         Total number of epochs to train for
     algo : str, optional
-        Learning rate scheduler algorithm: cosine, exponential
+        Learning rate scheduler algorithm: cosine, step, poly
     warmup_epochs : int
         Number of epochs to do linear learning rate warmup
     
@@ -753,16 +813,45 @@ def setup_lr_scheduler(
         Learning rate scheduler
     """
     scheduler = None
-    warmup = torch.optim.lr_scheduler.LinearLR(optimizer, total_iters=warmup_epochs, verbose=True)
+
+    # timm LR schedulers
     scheduling_algorithms = {
-        "cosine": torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs, verbose=True),
-        "exponential": torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99, verbose=True)
+        "cosine": CosineLRScheduler(
+            optimizer = optimizer, 
+            t_initial = total_epochs,  # no restarts
+            cycle_limit = 1,  #  no restarts
+            warmup_t = num_warmup_epochs,
+            warmup_lr_init = warmup_init_lr
+        ),
+        "poly": PolyLRScheduler(
+            optimizer = optimizer, 
+            t_initial = total_epochs,  # no restarts
+            cycle_limit = 1,  #  no restarts
+            warmup_t = num_warmup_epochs,
+            warmup_lr_init = warmup_init_lr
+        ),
+        "step": StepLRScheduler(
+            optimizer=optimizer,
+            decay_t = total_epochs // 4,  # 4, 5
+            decay_rate = 0.5,  # 0.25, 0.75
+            warmup_t = num_warmup_epochs,
+            warmup_lr_init = warmup_init_lr
+        ), 
     }
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer, 
-        [warmup, scheduling_algorithms[algo]], 
-        milestones=[warmup_epochs]
-    )
+    scheduler = scheduling_algorithms[algo]
+
+    # PyTorch-native LR schedulers
+    # warmup = torch.optim.lr_scheduler.LinearLR(optimizer, total_iters=num_warmup_epochs, verbose=True)
+    # scheduling_algorithms = {
+    #     "cosine": torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs, verbose=True),
+    #     "exponential": torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99, verbose=True)
+    # }
+    # scheduler = torch.optim.lr_scheduler.SequentialLR(
+    #     optimizer, 
+    #     [warmup, scheduling_algorithms[algo]], 
+    #     milestones=[num_warmup_epochs]
+    # )
+
     return scheduler
 
 
@@ -817,7 +906,22 @@ def main(args):
 
     # Set up training objects
     train_dataloader, val_dataloader, test_dataloader = setup_data(dataset_path, args.batch_size, args.seed, args.resample, args.dataset_size, args.augment)
-    model = setup_model(model_arch=args.model_arch, modality=args.modality, training_strategy=args.training_strategy, checkpoint_path=args.checkpoint_path, num_classes=NUM_CLASSES)
+    
+    model = setup_model(
+        model_arch=args.model_arch, 
+        modality=args.modality, 
+        training_strategy=args.training_strategy, 
+        checkpoint_path=args.checkpoint_path, 
+        num_classes=args.num_classes,
+        input_size=args.input_size,
+        stochastic_depth_rate=args.stochastic_depth_rate,
+        patch_dropout_rate=args.patch_dropout_rate,
+        position_embedding_dropout_rate=args.position_embedding_dropout_rate,
+        attention_dropout_rate=args.attention_dropout_rate,
+        projection_dropout_rate=args.projection_dropout_rate,
+        head_dropout_rate=args.head_dropout_rate
+    )
+    
     optimizer = setup_optimizer(model, algo=args.optimizer, training_strategy=args.training_strategy, lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = setup_lr_scheduler(optimizer, args.total_epochs, args.lr_scheduler, args.warmup_epochs) if args.lr_scheduler else None
     loss_fn = setup_loss_fn(modality=args.modality if args.weight_loss_fn else "none", label_smoothing=args.label_smoothing)
@@ -830,6 +934,7 @@ def main(args):
             config=args,
             resume=False,  # if True, continue logging from previous run if did not finish
         )
+        wandb_run_number = wandb.run.name.split("-")[-1]
 
     # Set up trainer
     trainer = Trainer(
@@ -863,7 +968,7 @@ def main(args):
             if os.path.exists(last_snapshot_path): 
                 os.remove(last_snapshot_path)
             if os.path.exists(best_snapshot_path):
-                os.rename(best_snapshot_path, f"{args.snapshot_path}/{wandb.run.name}.pth")
+                os.rename(best_snapshot_path, f"{args.snapshot_path}/{wandb_run_number}-{wandb.run.name}.pth")
 
     # Clean up
     wandb.finish()
@@ -876,38 +981,51 @@ if __name__ == "__main__":
     # Random seed
     parser.add_argument('--seed', type=int, default=0, help='Random seed')
 
-    # Task parameters
+    # Task/Dataset parameters
     parser.add_argument('--modality', type=str, default="OCT", help='Must be OCT, CFP, or PEDS_OPTOS')
     parser.add_argument('--dataset_path', type=str, help='Path to root directory of PyTorch ImageFolder dataset')
-    parser.add_argument('--checkpoint_path', type=str, help='Path to model checkpoint to finetune from')
-    parser.add_argument('--wandb_proj_name', default="retfound_referable_cfp_oct", type=str, help='Name of W&B project to log to')   
-        
-    # Data Hyperparameters
-    parser.add_argument('--weight_loss_fn', action='store_true', help='Weight loss function to balance classes')
-    parser.add_argument('--resample', action='store_true', help='Resample training data to balance classes')
-    parser.add_argument('--label_smoothing', type=float, default=0.0, help='Add uniformly distributed smoothing when computing the loss; range 0.0-1.0 where 0.0 means no smoothing')
     parser.add_argument('--dataset_size', type=int, help='Number of training images to train the model with.')  # CFP: 650, OCT: 914
-    parser.add_argument('--augment', type=str, default="randaugment", help='Data augmentation strategy: none, trivialaugment, randaugment, autoaugment, augmix, deit3') 
-    # parser.add_argument('--cutmixup', type=bool, default=False, help='Whether to use CutMix/MixUp data augmentation')  # TODO: add/fix cutmixup
+    parser.add_argument('--wandb_proj_name', default="retfound_referable_cfp_oct", type=str, help='Name of W&B project to log to')   
+    parser.add_argument('--num_classes', type=int, default=2, help='Number of classes of interest')
+    parser.add_argument('--input_size', type=int, default=224, help='Input image size')
     
-    # Training Hyperparameters
-    parser.add_argument('--training_strategy', type=str, default="full_finetune", help="Training strategy: full_finetune, linear_probe, surgical_finetune, sft_and_lp")  
-    parser.add_argument('--mixed_precision', action='store_true', help='Use automatic mixed precision')
+    # Model and Training Strategy
     parser.add_argument('--model_arch', type=str, default="retfound", help='Model architecture: resnet50, vit_large, retfound')
-    
+    parser.add_argument('--checkpoint_path', type=str, help='Path to model checkpoint to finetune from')
+    parser.add_argument('--training_strategy', type=str, default="full_finetune", help="Training strategy: full_finetune, linear_probe, surgical_finetune, sft_and_lp")  
+    # parser.add_argument('--global_average_pooling', action='store_true', help='Use global average pooling')  # TODO: debug
+ 
+    # Batch size (can increase with mixed precision, gradient accumulation), Number of epochs
+    parser.add_argument('--mixed_precision', action='store_true', help='Use automatic mixed precision')
     parser.add_argument('--batch_size', type=int, default=64, help='Input batch size on each device')  # max batch_size with AMP {full_finetune: 64, linear_probe: 1024+}
     parser.add_argument('--grad_accum_steps', type=int, default=1, help='Number of gradient accumulation steps before performing optimizer step. Effective batch size becomes batch_size * gradient_accumulation_steps * num_gpus')
     parser.add_argument('--total_epochs', type=int, default=30, help='Total epochs to train the model')
     
+    # Optimizer, Learning Rate, Learning Rate Schedule
     parser.add_argument('--optimizer', type=str, default="lars", help='Optimizer: adam, adamw, lars, lamb')
     parser.add_argument('--learning_rate', type=float, default=0.3, help='Learning rate')
-    parser.add_argument('--lr_scheduler', type=str, help='Learning rate scheduler: cosine, exponential')  
+    parser.add_argument('--lr_scheduler', type=str, help='Learning rate scheduler: cosine, poly, step')  
     parser.add_argument('--warmup_epochs', type=int, default=0, help='epochs to warm up LR')
-    parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay')
-    
-    # parser.add_argument('--global_average_pooling', type=bool, default=False, help='Use global average pooling')  # TODO: debug
 
-    # Checkpointing parameters
+    # Data Augmentation
+    parser.add_argument('--augment', type=str, default="randaugment", help='Data augmentation strategy: none, trivialaugment, randaugment, autoaugment, augmix, deit3') 
+    # parser.add_argument('--cutmixup', type=bool, default=False, help='Whether to use CutMix/MixUp data augmentation')  # TODO: add/fix cutmixup
+
+    # Regularization
+    parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay')
+    parser.add_argument('--label_smoothing', type=float, default=0.0, help='Add uniformly distributed smoothing when computing the loss; range 0.0-1.0 where 0.0 means no smoothing')
+    parser.add_argument('--stochastic_depth_rate', type=float, default=0.0, help='Stochastic depth rate for ViT')
+    parser.add_argument('--patch_dropout_rate', type=float, default=0.0, help='Patch dropout rate for ViT')
+    parser.add_argument('--position_embedding_dropout_rate', type=float, default=0.0, help='Position embedding dropout rate for ViT')
+    parser.add_argument('--attention_dropout_rate', type=float, default=0.0, help='Attention dropout rate for ViT')
+    parser.add_argument('--projection_dropout_rate', type=float, default=0.0, help='Projection layer dropout rate for ViT')
+    parser.add_argument('--head_dropout_rate', type=float, default=0.0, help='Classification head dropout rate for ViT')
+
+    # Class imbalance
+    parser.add_argument('--weight_loss_fn', action='store_true', help='Weight loss function to balance classes')
+    parser.add_argument('--resample', action='store_true', help='Resample training data to balance classes')
+
+    # Checkpointing
     parser.add_argument('--save_every', type=int, default=1, help='Save a snapshot every _ epochs')
     parser.add_argument('--snapshot_path', type=str, 
                         default="/home/dkuo/RetFound/tasks/referable_CFP_OCT/snapshots",
