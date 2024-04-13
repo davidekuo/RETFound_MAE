@@ -37,7 +37,7 @@ import models_vit
 from util.lars import LARS
 from util.pos_embed import interpolate_pos_embed
 from util.sam import SAM, disable_running_stats, enable_running_stats
-
+from util.samplers import DatasetFromSampler, DistributedSamplerWrapper, RepeatedAugmentationSampler
 
 CFP_CHKPT_PATH = "/home/dkuo/RetFound/model_checkpoints/RETFound_cfp_weights.pth"
 OCT_CHKPT_PATH = "/home/dkuo/RetFound/model_checkpoints/RETFound_oct_weights.pth"
@@ -254,7 +254,9 @@ class Trainer:
         """ Train for one epoch """
         batch_size = len(next(iter(self.train_dataloader))[0])
         print(f"\n[GPU{self.gpu_id}] Epoch {epoch} | Batch size {batch_size} | Steps: {len(self.train_dataloader)}")
-        self.train_dataloader.sampler.set_epoch(epoch)
+        self.train_dataloader.sampler.set_epoch(epoch)  
+        # In distributed mode, calling the set_epoch() method at the beginning of each epoch before creating the DataLoader 
+        # iterator is necessary to make shuffling work properly across multiple epochs. Otherwise, the same ordering will be always used.
         
         for index, batch in enumerate(self.train_dataloader):
             inputs, targets = batch
@@ -300,88 +302,6 @@ class Trainer:
             print("====================================\n")
 
 
-# From https://github.com/catalyst-team/catalyst/blob/ea3fadbaa6034dabeefbbb53ab8c310186f6e5d0/catalyst/data/dataset/torch.py#L13
-class DatasetFromSampler(Dataset):
-    """Dataset to create indexes from `Sampler`.
-
-    Args:
-        sampler: PyTorch sampler
-    """
-
-    def __init__(self, sampler: torch.utils.data.Sampler):
-        """Initialisation for DatasetFromSampler."""
-        self.sampler = sampler
-        self.sampler_list = None
-
-    def __getitem__(self, index: int):
-        """Gets element of the dataset.
-
-        Args:
-            index: index of the element in the dataset
-
-        Returns:
-            Single element by index
-        """
-        if self.sampler_list is None:
-            self.sampler_list = list(self.sampler)
-        return self.sampler_list[index]
-
-    def __len__(self) -> int:
-        """
-        Returns:
-            int: length of the dataset
-        """
-        return len(self.sampler)
-
-
-# From https://github.com/catalyst-team/catalyst/blob/ea3fadbaa6034dabeefbbb53ab8c310186f6e5d0/catalyst/data/sampler.py#L522
-class DistributedSamplerWrapper(DistributedSampler):
-    """
-    Wrapper over `Sampler` for distributed training.
-    Allows you to use any sampler in distributed mode.
-
-    It is especially useful in conjunction with
-    `torch.nn.parallel.DistributedDataParallel`. In such case, each
-    process can pass a DistributedSamplerWrapper instance as a DataLoader
-    sampler, and load a subset of subsampled data of the original dataset
-    that is exclusive to it.
-
-    .. note::
-        Sampler is assumed to be of constant size.
-    """
-
-    def __init__(
-        self,
-        sampler,
-        num_replicas: Optional[int] = None,
-        rank: Optional[int] = None,
-        shuffle: bool = True,
-    ):
-        """
-        Args:
-            sampler: Sampler used for subsampling
-            num_replicas (int, optional): Number of processes participating in
-              distributed training
-            rank (int, optional): Rank of the current process
-              within ``num_replicas``
-            shuffle (bool, optional): If true (default),
-              sampler will shuffle the indices
-        """
-        super(DistributedSamplerWrapper, self).__init__(
-            DatasetFromSampler(sampler),
-            num_replicas=num_replicas,
-            rank=rank,
-            shuffle=shuffle,
-        )
-        self.sampler = sampler
-
-    def __iter__(self):
-        self.dataset = DatasetFromSampler(self.sampler)
-        indexes_of_indexes = super().__iter__()
-        subsampler_indexes = self.dataset
-        return iter(itemgetter(*indexes_of_indexes)(subsampler_indexes))
-
-
 def setup_ddp():
     """ Set up distributed data parallel (DDP) training """
     init_process_group(backend="nccl")
@@ -397,11 +317,17 @@ def set_seed_everywhere(seed: int):
     os.environ['PYTHONHASHSEED'] = str(seed)
 
 
-def _default_data_transform():
-    """ Return default data transforms (based on ImageNet dataset) - for val and test datasets """
+def _default_data_transform(image_size: int):
+    """ 
+    Return default data transforms (based on ImageNet dataset) - for val and test datasets 
+    Parameters
+    ----------
+    image_size : int
+        Expected image size for model
+    """
     return transforms.Compose([
         transforms.Resize(
-            (RETFOUND_EXPECTED_IMAGE_SIZE, RETFOUND_EXPECTED_IMAGE_SIZE),
+            (image_size, image_size),
             interpolation=transforms.InterpolationMode.BICUBIC
         ),
         # transforms.CenterCrop(RETFOUND_EXPECTED_IMAGE_SIZE), 
@@ -410,10 +336,12 @@ def _default_data_transform():
     ])
 
 
-def _augment_data_transform(augment: str):
+def _augment_data_transform(image_size: int, augment: str):
     """
     Parameters
     ----------
+    image_size : int
+        Expected image size for model
     augment : str
         Data augmentation strategy: "trivialaugment", "randaugment", "autoaugment", "augmix", "deit3"
 
@@ -452,9 +380,9 @@ def _augment_data_transform(augment: str):
     assert augment in augmentations, f"Data augmentation strategy must be 'none' or one of {list(augmentations.keys())}"
 
     return transforms.Compose([
-        transforms.Resize(RETFOUND_EXPECTED_IMAGE_SIZE, 
-                          interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(RETFOUND_EXPECTED_IMAGE_SIZE),  # or Resize([224, 224])?
+        transforms.Resize(
+            (image_size, image_size), 
+            interpolation=transforms.InterpolationMode.BICUBIC),
         augmentations[augment], 
         transforms.ToTensor(),
         transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
@@ -509,7 +437,16 @@ def _setup_dataloader(dataset: Dataset, batch_size: int, sampler: torch.utils.da
     )
 
 
-def setup_data(dataset_path: str, batch_size: int, random_seed: int, resample: bool = False, dataset_size: int = None, augment: str = "none", cutmixup: bool = False):
+def setup_data(
+        dataset_path: str, 
+        batch_size: int, 
+        random_seed: int, 
+        resample: bool = False, 
+        # num_augment_repeats: int = 1,
+        dataset_size: int = None, 
+        augment: str = "none", 
+        cutmixup: bool = False
+    ):
     """
     Parameters
     ----------
@@ -521,6 +458,8 @@ def setup_data(dataset_path: str, batch_size: int, random_seed: int, resample: b
         Random seed for reproducibility
     resample : bool, optional
         Whether to resample training dataset to balance classes, by default False
+    num_augment_repeats : int, optional
+        Number of times to augment each image in the training dataset, by default 1
     dataset_size : int, optional
         Number of images to sample from the training set. Use all images if not specified.
     augment : str, optional
@@ -564,6 +503,15 @@ def setup_data(dataset_path: str, batch_size: int, random_seed: int, resample: b
         # Set up sampler
         train_sampler = torch.utils.data.WeightedRandomSampler(sample_weights, len(sample_weights), generator=prng)
         train_sampler = DistributedSamplerWrapper(train_sampler)  # for DDP
+    
+    # if num_augment_repeats > 1:
+    #     train_sampler = RepeatedAugmentationSampler(
+    #         train_dataset, 
+    #         shuffle=True, 
+    #         num_repeats=num_augment_repeats
+    #     )
+    #     # TODO: enforce class balance with repeated augmentations
+    
     else:
         train_sampler = None
     
@@ -832,7 +780,7 @@ def setup_lr_scheduler(
         ),
         "step": StepLRScheduler(
             optimizer=optimizer,
-            decay_t = total_epochs // 4,  # 4, 5
+            decay_t = total_epochs // (4 * total_epochs / 50),  # 4, 5 ... initial training runs done with 50 epochs
             decay_rate = 0.5,  # 0.25, 0.75
             warmup_t = num_warmup_epochs,
             warmup_lr_init = warmup_init_lr
@@ -905,7 +853,15 @@ def main(args):
     best_snapshot_path = args.snapshot_path + "/best.pth"
 
     # Set up training objects
-    train_dataloader, val_dataloader, test_dataloader = setup_data(dataset_path, args.batch_size, args.seed, args.resample, args.dataset_size, args.augment)
+    train_dataloader, val_dataloader, test_dataloader = setup_data(
+        dataset_path=dataset_path, 
+        batch_size=args.batch_size, 
+        random_seed=args.seed, 
+        # num_augment_repeats=args.num_augment_repeats,
+        resample=args.resample, 
+        dataset_size=args.dataset_size, 
+        augment=args.augment
+    )
     
     model = setup_model(
         model_arch=args.model_arch, 
@@ -964,7 +920,7 @@ def main(args):
         # If training finishes successfully, delete the last.pth model snapshot using gpu 0
         # and rename best.pth to [wandb_run_name].pth
         if gpu_id == 0:
-            print(f"\nTraining completed successfully! Deleting last.pth and saving best.pth as {wandb.run.name}.pth\n")
+            print(f"\nTraining completed successfully! Deleting last.pth and saving best.pth as {wandb_run_number}-{wandb.run.name}.pth\n")
             if os.path.exists(last_snapshot_path): 
                 os.remove(last_snapshot_path)
             if os.path.exists(best_snapshot_path):
@@ -993,7 +949,7 @@ if __name__ == "__main__":
     parser.add_argument('--model_arch', type=str, default="retfound", help='Model architecture: resnet50, vit_large, retfound')
     parser.add_argument('--checkpoint_path', type=str, help='Path to model checkpoint to finetune from')
     parser.add_argument('--training_strategy', type=str, default="full_finetune", help="Training strategy: full_finetune, linear_probe, surgical_finetune, sft_and_lp")  
-    # parser.add_argument('--global_average_pooling', action='store_true', help='Use global average pooling')  # TODO: debug
+    # TODO: debug  # parser.add_argument('--global_average_pooling', action='store_true', help='Use global average pooling')  
  
     # Batch size (can increase with mixed precision, gradient accumulation), Number of epochs
     parser.add_argument('--mixed_precision', action='store_true', help='Use automatic mixed precision')
@@ -1009,7 +965,8 @@ if __name__ == "__main__":
 
     # Data Augmentation
     parser.add_argument('--augment', type=str, default="randaugment", help='Data augmentation strategy: none, trivialaugment, randaugment, autoaugment, augmix, deit3') 
-    # parser.add_argument('--cutmixup', type=bool, default=False, help='Whether to use CutMix/MixUp data augmentation')  # TODO: add/fix cutmixup
+    # parser.add_argument('--num_augment_repeats', type=int, default=1, help='Number of augmented samples per sampled input image - RepeatedAugmentationSampler samples batch_size / num_augment_repeats input images per batch to maintain constant batch size')
+    # TODO: debug  # parser.add_argument('--cutmixup', type=bool, default=False, help='Whether to use CutMix/MixUp data augmentation')  
 
     # Regularization
     parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay')
