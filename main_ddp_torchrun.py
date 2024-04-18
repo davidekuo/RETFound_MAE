@@ -37,7 +37,7 @@ import models_vit
 from util.lars import LARS
 from util.pos_embed import interpolate_pos_embed
 from util.sam import SAM, disable_running_stats, enable_running_stats
-from util.samplers import DatasetFromSampler, DistributedSamplerWrapper, RepeatedAugmentationSampler
+from util.samplers import DistributedSamplerWrapper, RepeatedAugmentationSampler
 
 CFP_CHKPT_PATH = "/home/dkuo/RetFound/model_checkpoints/RETFound_cfp_weights.pth"
 OCT_CHKPT_PATH = "/home/dkuo/RetFound/model_checkpoints/RETFound_oct_weights.pth"
@@ -323,42 +323,30 @@ def _default_data_transform(image_size: int):
     Parameters
     ----------
     image_size : int
-        Expected image size for model
+        Input image size for model; if -1, do not resize images
     """
-    return transforms.Compose([
-        transforms.Resize(
-            (image_size, image_size),
-            interpolation=transforms.InterpolationMode.BICUBIC
-        ),
-        # transforms.CenterCrop(RETFOUND_EXPECTED_IMAGE_SIZE), 
+    transforms_list = [
         transforms.ToTensor(),
         transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
-    ])
+    ]
+    if image_size > 0:
+        transforms_list.insert(0, transforms.Resize((image_size, image_size), interpolation=transforms.InterpolationMode.BICUBIC))
 
+    return transforms.Compose(transforms_list)
 
 def _augment_data_transform(image_size: int, augment: str):
     """
     Parameters
     ----------
     image_size : int
-        Expected image size for model
+        Input image size for model; if -1, do not resize images
     augment : str
-        Data augmentation strategy: "trivialaugment", "randaugment", "autoaugment", "augmix", "deit3"
+        Data augmentation strategy: "trivialaugment", "randaugment", "autoaugment", "augmix"
 
     Returns
     -------
     Data transforms for specified data augmentation strategy
     """
-    # Re-implementation / approximation of DeiT3 3-Augment
-    deit3_transforms = transforms.Compose([
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomChoice([
-            transforms.RandomGrayscale(p=0.2), 
-            transforms.RandomSolarize(threshold=130, p=0.2),
-            transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.2),
-        ]),
-        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
-    ])
 
     """
     # timm randaugment
@@ -375,18 +363,18 @@ def _augment_data_transform(image_size: int, augment: str):
         "randaugment": transforms.RandAugment(num_ops=4, magnitude=12),
         "autoaugment": transforms.AutoAugment(),
         "augmix": transforms.AugMix(),
-        "deit3": deit3_transforms,
     }
     assert augment in augmentations, f"Data augmentation strategy must be 'none' or one of {list(augmentations.keys())}"
 
-    return transforms.Compose([
-        transforms.Resize(
-            (image_size, image_size), 
-            interpolation=transforms.InterpolationMode.BICUBIC),
-        augmentations[augment], 
+    transforms_list = [
+        augmentations[augment],
         transforms.ToTensor(),
         transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
-    ])
+    ]
+    if image_size > 0:
+        transforms_list.insert(0, transforms.Resize((image_size, image_size), interpolation=transforms.InterpolationMode.BICUBIC))
+    
+    return transforms.Compose(transforms_list)
 
     # for torchvision.transforms.v2
     # return transforms.Compose([
@@ -439,10 +427,11 @@ def _setup_dataloader(dataset: Dataset, batch_size: int, sampler: torch.utils.da
 
 def setup_data(
         dataset_path: str, 
+        image_size: int,
         batch_size: int, 
         random_seed: int, 
         resample: bool = False, 
-        # num_augment_repeats: int = 1,
+        num_augment_repeats: int = None,
         dataset_size: int = None, 
         augment: str = "none", 
         cutmixup: bool = False
@@ -452,6 +441,8 @@ def setup_data(
     ----------
     dataset_path : str
         Path to root directory of PyTorch ImageFolder dataset
+    image_size : int
+        Input image size for model; if -1, do not resize images
     batch_size : int
         Batch size for dataloaders
     random_seed : int
@@ -473,13 +464,13 @@ def setup_data(
         Dataloaders for training, validation, and test sets
     """
     # Set up data augmentations
-    train_transform = _default_data_transform() if augment == "none" else _augment_data_transform(augment)
+    train_transform = _default_data_transform(image_size) if augment == "none" else _augment_data_transform(image_size, augment)
     train_collate_fn = _cutmixup_collate_fn if cutmixup else None
 
     # Set up datasets
     train_dataset = datasets.ImageFolder(dataset_path + "/train", transform=train_transform)
-    val_dataset = datasets.ImageFolder(dataset_path + "/val", transform=_default_data_transform())
-    test_dataset = datasets.ImageFolder(dataset_path + "/test", transform=_default_data_transform())
+    val_dataset = datasets.ImageFolder(dataset_path + "/val", transform=_default_data_transform(image_size))
+    test_dataset = datasets.ImageFolder(dataset_path + "/test", transform=_default_data_transform(image_size))
 
     # If specified, take a random subset of the training dataset of size 'dataset_size' 
     if dataset_size:
@@ -504,21 +495,21 @@ def setup_data(
         train_sampler = torch.utils.data.WeightedRandomSampler(sample_weights, len(sample_weights), generator=prng)
         train_sampler = DistributedSamplerWrapper(train_sampler)  # for DDP
     
-    # if num_augment_repeats > 1:
-    #     train_sampler = RepeatedAugmentationSampler(
-    #         train_dataset, 
-    #         shuffle=True, 
-    #         num_repeats=num_augment_repeats
-    #     )
-    #     # TODO: enforce class balance with repeated augmentations
+    elif num_augment_repeats is not None:
+        train_sampler = RepeatedAugmentationSampler(
+            train_dataset, 
+            shuffle=True, 
+            num_repeats=num_augment_repeats
+        )
+        # TODO: enforce class balance with repeated augmentations
     
     else:
         train_sampler = None
     
     # Set up and return dataloaders
-    train_dataloader = _setup_dataloader(train_dataset, args.batch_size, train_sampler, train_collate_fn)
-    val_dataloader = _setup_dataloader(val_dataset, args.batch_size)
-    test_dataloader = _setup_dataloader(test_dataset, args.batch_size)
+    train_dataloader = _setup_dataloader(train_dataset, batch_size, train_sampler, train_collate_fn)
+    val_dataloader = _setup_dataloader(val_dataset, batch_size)
+    test_dataloader = _setup_dataloader(test_dataset, batch_size)
 
     return train_dataloader, val_dataloader, test_dataloader
 
@@ -529,7 +520,7 @@ def setup_model(
         training_strategy: str,
         checkpoint_path: str = None,
         num_classes: int = 2, 
-        input_size: int = 224,
+        image_size: int = 224,
         global_pool: bool = False,
         stochastic_depth_rate: float = 0.0,
         patch_dropout_rate: float = 0.0,
@@ -551,7 +542,7 @@ def setup_model(
         Path to model checkpoint to finetune from, by default None
     num_classes : int, optional
         Number of classes, by default 2
-    input_size : int, optional
+    image_size : int, optional
         Input image size, by default 224
     global_pool : bool, optional
         Whether to use global average pooling, by default False
@@ -594,7 +585,7 @@ def setup_model(
             'vit_large_patch16_224.augreg_in21k_ft_in1k', 
             pretrained=True, 
             num_classes=num_classes,
-            img_size=input_size,
+            img_size=image_size,
             drop_path_rate=stochastic_depth_rate,
             patch_drop_rate=patch_dropout_rate,
             drop_rate=head_dropout_rate,
@@ -628,7 +619,7 @@ def setup_model(
         print("Setting up RetFound model")
         model = models_vit.__dict__['vit_large_patch16'](
             num_classes=num_classes,
-            img_size=input_size,
+            img_size=image_size,
             global_pool=global_pool,
             drop_path_rate=stochastic_depth_rate,
             patch_drop_rate=patch_dropout_rate,
@@ -821,13 +812,13 @@ def setup_loss_fn(modality: str = "none", label_smoothing: float = 0.0):
     # CFP training set has 548 normal and 102 referable (0.19) -> class_weights = [1.0, 5.0]
     # OCT training set has 782 normal and 132 referable (0.17) -> class_weights = [1.0, 5.0]
     
-    # peds_optos
-    # CFP training set has 148 abnormal and 68 normal (0.43) -> class_weights = [1.0, 2.3]
+    # peds_optos_uwf
+    # Optos training set has 142 abnormal and 43 normal (0.33) -> class_weights = [1.0, 3.0]
 
     class_weights = {
         "CFP": torch.tensor([1.0, 5.0]).cuda(),
         "OCT": torch.tensor([1.0, 5.0]).cuda(),
-        "PEDS_OPTOS": torch.tensor([1.0, 2.3]).cuda(),
+        "PEDS_OPTOS": torch.tensor([1.0, 3.0]).cuda(),
     }
     return torch.nn.CrossEntropyLoss(
         weight=class_weights[modality] if modality in class_weights else None,
@@ -855,9 +846,10 @@ def main(args):
     # Set up training objects
     train_dataloader, val_dataloader, test_dataloader = setup_data(
         dataset_path=dataset_path, 
+        image_size=args.image_size,
         batch_size=args.batch_size, 
         random_seed=args.seed, 
-        # num_augment_repeats=args.num_augment_repeats,
+        num_augment_repeats=args.num_augment_repeats,
         resample=args.resample, 
         dataset_size=args.dataset_size, 
         augment=args.augment
@@ -869,7 +861,7 @@ def main(args):
         training_strategy=args.training_strategy, 
         checkpoint_path=args.checkpoint_path, 
         num_classes=args.num_classes,
-        input_size=args.input_size,
+        image_size=args.image_size,
         stochastic_depth_rate=args.stochastic_depth_rate,
         patch_dropout_rate=args.patch_dropout_rate,
         position_embedding_dropout_rate=args.position_embedding_dropout_rate,
@@ -943,7 +935,7 @@ if __name__ == "__main__":
     parser.add_argument('--dataset_size', type=int, help='Number of training images to train the model with.')  # CFP: 650, OCT: 914
     parser.add_argument('--wandb_proj_name', default="retfound_referable_cfp_oct", type=str, help='Name of W&B project to log to')   
     parser.add_argument('--num_classes', type=int, default=2, help='Number of classes of interest')
-    parser.add_argument('--input_size', type=int, default=224, help='Input image size')
+    parser.add_argument('--image_size', type=int, default=224, help='Input image size for model; if -1, do not resize images')
     
     # Model and Training Strategy
     parser.add_argument('--model_arch', type=str, default="retfound", help='Model architecture: resnet50, vit_large, retfound')
@@ -964,8 +956,8 @@ if __name__ == "__main__":
     parser.add_argument('--warmup_epochs', type=int, default=0, help='epochs to warm up LR')
 
     # Data Augmentation
-    parser.add_argument('--augment', type=str, default="randaugment", help='Data augmentation strategy: none, trivialaugment, randaugment, autoaugment, augmix, deit3') 
-    # parser.add_argument('--num_augment_repeats', type=int, default=1, help='Number of augmented samples per sampled input image - RepeatedAugmentationSampler samples batch_size / num_augment_repeats input images per batch to maintain constant batch size')
+    parser.add_argument('--augment', type=str, default="randaugment", help='Data augmentation strategy: none, trivialaugment, randaugment, autoaugment, augmix') 
+    parser.add_argument('--num_augment_repeats', type=int, help='Number of augmented samples per sampled input image - RepeatedAugmentationSampler samples batch_size / num_augment_repeats input images per batch to maintain constant batch size')
     # TODO: debug  # parser.add_argument('--cutmixup', type=bool, default=False, help='Whether to use CutMix/MixUp data augmentation')  
 
     # Regularization
