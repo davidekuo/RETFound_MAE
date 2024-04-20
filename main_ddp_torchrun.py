@@ -8,10 +8,9 @@
 import argparse
 from contextlib import nullcontext
 import numpy as np
-from operator import itemgetter
 import os
 import random
-from typing import Optional
+from typing import Tuple, Union
 import wandb
 
 import torch
@@ -25,7 +24,7 @@ from torchvision import datasets, transforms
 # import torchvision.transforms.v2 as transforms_v2
 
 import timm
-from timm.data.auto_augment import rand_augment_transform
+from timm.data.auto_augment import rand_augment_transform, augment_and_mix_transform
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.models.layers import trunc_normal_
 from timm.optim import Lamb
@@ -317,74 +316,57 @@ def set_seed_everywhere(seed: int):
     os.environ['PYTHONHASHSEED'] = str(seed)
 
 
-def _default_data_transform(image_size: int):
-    """ 
-    Return default data transforms (based on ImageNet dataset) - for val and test datasets 
-    Parameters
-    ----------
-    image_size : int
-        Input image size for model; if -1, do not resize images
-    """
-    transforms_list = [
-        transforms.ToTensor(),
-        transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
-    ]
-    if image_size > 0:
-        transforms_list.insert(0, transforms.Resize((image_size, image_size), interpolation=transforms.InterpolationMode.BICUBIC))
-
-    return transforms.Compose(transforms_list)
-
-def _augment_data_transform(image_size: int, augment: str):
+def _data_transform(image_size: Union[int, Tuple[int, int]], augment: str):
     """
     Parameters
     ----------
-    image_size : int
-        Input image size for model; if -1, do not resize images
+    image_size : Union[int, Tuple[int, int]]
+        Input image size for model
+            If int size is provided, input image size will be (size, size)
+            If Tuple (height, width) is provided, input image size will be (height, width)
     augment : str
-        Data augmentation strategy: "trivialaugment", "randaugment", "autoaugment", "augmix"
+        timm data augmentation config string: None, "rand-m#-n#-mstd#", or "augmix-m#-w#-d#-mstd#"
 
     Returns
     -------
     Data transforms for specified data augmentation strategy
     """
 
-    """
-    # timm randaugment
-    augmentations = {
-        "randaugment": rand_augment_transform(
-            config_string=f"rand-m10-n4-mstd0.5",
-            hparams=None,
-        )
-    }
-    """
+    transforms_list = [
+        transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BILINEAR),
+        transforms.ToTensor(),
+        transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
+    ]
 
+    if augment is not None:
+        augment_strategy = augment.split("-")[0]
+        assert augment_strategy in ["rand", "augmix"], "timm data augmentation config string must start with rand- or augmix-"
+        if augment_strategy == "rand":  # insert RandAugment after Resize
+            transforms_list.insert(1, rand_augment_transform(config_string=augment, hparams={"img_mean": IMAGENET_DEFAULT_MEAN, "img_std": IMAGENET_DEFAULT_STD}))
+        else:  # augment_strategy == "augmix" - insert AugMix after Resize
+            transforms_list.insert(1, augment_and_mix_transform(config_string=augment, hparams={"img_mean": IMAGENET_DEFAULT_MEAN, "img_std": IMAGENET_DEFAULT_STD}))
+    
+    return transforms.Compose(transforms_list)
+
+    """
+    # torchvision data augmentations
     augmentations = {
         "trivialaugment": transforms.TrivialAugmentWide(),
         "randaugment": transforms.RandAugment(num_ops=4, magnitude=12),
         "autoaugment": transforms.AutoAugment(),
         "augmix": transforms.AugMix(),
     }
-    assert augment in augmentations, f"Data augmentation strategy must be 'none' or one of {list(augmentations.keys())}"
-
-    transforms_list = [
-        augmentations[augment],
-        transforms.ToTensor(),
-        transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
-    ]
-    if image_size > 0:
-        transforms_list.insert(0, transforms.Resize((image_size, image_size), interpolation=transforms.InterpolationMode.BICUBIC))
     
-    return transforms.Compose(transforms_list)
-
-    # for torchvision.transforms.v2
-    # return transforms.Compose([
-    #     augmentations[augment],
-    #     transforms.Resize(RETFOUND_EXPECTED_IMAGE_SIZE, 
-    #                       interpolation=transforms.InterpolationMode.BICUBIC),
-    #     transforms.CenterCrop(RETFOUND_EXPECTED_IMAGE_SIZE),  # or Resize([224, 224])? 
-    #     transforms.ToDtype(torch.float32, scale=True),
-    #     transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
-    # ])
+    for torchvision.transforms.v2
+    return transforms.Compose([
+        augmentations[augment],
+        transforms.Resize(RETFOUND_EXPECTED_IMAGE_SIZE, 
+                          interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(RETFOUND_EXPECTED_IMAGE_SIZE),  # or Resize([224, 224])? 
+        transforms.ToDtype(torch.float32, scale=True),
+        transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
+    ])
+    """
 
 
 def _cutmixup_collate_fn(batch):
@@ -433,7 +415,7 @@ def setup_data(
         resample: bool = False, 
         num_augment_repeats: int = None,
         dataset_size: int = None, 
-        augment: str = "none", 
+        augment: str = None, 
         cutmixup: bool = False
     ):
     """
@@ -454,7 +436,7 @@ def setup_data(
     dataset_size : int, optional
         Number of images to sample from the training set. Use all images if not specified.
     augment : str, optional
-        Data augmentation strategy: "none", "trivialaugment", "randaugment", "autoaugment", "augmix", "deit3"; by default "none"
+        Data augmentation strategy: None, "rand-m#-n#-mstd#", or "augmix-m#-w#-d#-mstd#"
     cutmixup : bool, optional
         Whether to use CutMix/MixUp data augmentation, by default False
     
@@ -464,13 +446,12 @@ def setup_data(
         Dataloaders for training, validation, and test sets
     """
     # Set up data augmentations
-    train_transform = _default_data_transform(image_size) if augment == "none" else _augment_data_transform(image_size, augment)
     train_collate_fn = _cutmixup_collate_fn if cutmixup else None
 
     # Set up datasets
-    train_dataset = datasets.ImageFolder(dataset_path + "/train", transform=train_transform)
-    val_dataset = datasets.ImageFolder(dataset_path + "/val", transform=_default_data_transform(image_size))
-    test_dataset = datasets.ImageFolder(dataset_path + "/test", transform=_default_data_transform(image_size))
+    train_dataset = datasets.ImageFolder(dataset_path + "/train", transform=_data_transform(image_size, augment))
+    val_dataset = datasets.ImageFolder(dataset_path + "/val", transform=_data_transform(image_size, augment=None))
+    test_dataset = datasets.ImageFolder(dataset_path + "/test", transform=_data_transform(image_size, augment=None))
 
     # If specified, take a random subset of the training dataset of size 'dataset_size' 
     if dataset_size:
@@ -779,7 +760,7 @@ def setup_lr_scheduler(
     }
     scheduler = scheduling_algorithms[algo]
 
-    # PyTorch-native LR schedulers
+    # PyTorch LR schedulers
     # warmup = torch.optim.lr_scheduler.LinearLR(optimizer, total_iters=num_warmup_epochs, verbose=True)
     # scheduling_algorithms = {
     #     "cosine": torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs, verbose=True),
@@ -846,7 +827,7 @@ def main(args):
     # Set up training objects
     train_dataloader, val_dataloader, test_dataloader = setup_data(
         dataset_path=dataset_path, 
-        image_size=args.image_size,
+        image_size=(args.image_height, args.image_width),
         batch_size=args.batch_size, 
         random_seed=args.seed, 
         num_augment_repeats=args.num_augment_repeats,
@@ -861,7 +842,7 @@ def main(args):
         training_strategy=args.training_strategy, 
         checkpoint_path=args.checkpoint_path, 
         num_classes=args.num_classes,
-        image_size=args.image_size,
+        image_size=(args.image_height, args.image_width),
         stochastic_depth_rate=args.stochastic_depth_rate,
         patch_dropout_rate=args.patch_dropout_rate,
         position_embedding_dropout_rate=args.position_embedding_dropout_rate,
@@ -935,7 +916,8 @@ if __name__ == "__main__":
     parser.add_argument('--dataset_size', type=int, help='Number of training images to train the model with.')  # CFP: 650, OCT: 914
     parser.add_argument('--wandb_proj_name', default="retfound_referable_cfp_oct", type=str, help='Name of W&B project to log to')   
     parser.add_argument('--num_classes', type=int, default=2, help='Number of classes of interest')
-    parser.add_argument('--image_size', type=int, default=224, help='Input image size for model; if -1, do not resize images')
+    parser.add_argument('--image_height', type=int, default=224, help='Input image height for model')
+    parser.add_argument('--image_width', type=int, default=224, help='Input image width for model')
     
     # Model and Training Strategy
     parser.add_argument('--model_arch', type=str, default="retfound", help='Model architecture: resnet50, vit_large, retfound')
@@ -956,7 +938,7 @@ if __name__ == "__main__":
     parser.add_argument('--warmup_epochs', type=int, default=0, help='epochs to warm up LR')
 
     # Data Augmentation
-    parser.add_argument('--augment', type=str, default="randaugment", help='Data augmentation strategy: none, trivialaugment, randaugment, autoaugment, augmix') 
+    parser.add_argument('--augment', type=str, help='Data augmentation config string: None, "rand-m#-n#-mstd#", or "augmix-m#-w#-d#-mstd#"') 
     parser.add_argument('--num_augment_repeats', type=int, help='Number of augmented samples per sampled input image - RepeatedAugmentationSampler samples batch_size / num_augment_repeats input images per batch to maintain constant batch size')
     # TODO: debug  # parser.add_argument('--cutmixup', type=bool, default=False, help='Whether to use CutMix/MixUp data augmentation')  
 
