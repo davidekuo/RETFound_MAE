@@ -65,6 +65,7 @@ class Trainer:
             best_snapshot_path: str,
             test_snapshot_path: str = None,
             mixed_precision: bool = False,
+            grad_clip_max_norm: float = None,
             evaluate_on_final_test_set: bool = False,
     ) -> None:
         # model, optimizer, loss
@@ -80,6 +81,9 @@ class Trainer:
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.loss_fn = loss_fn
+
+        # gradient clipping
+        self.grad_clip_max_norm = grad_clip_max_norm
 
         # mixed precision
         self.mixed_precision = mixed_precision
@@ -161,9 +165,14 @@ class Trainer:
         
         if take_gradient_step:
             if self.mixed_precision:
+                if self.grad_clip_max_norm:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_max_norm)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
+                if self.grad_clip_max_norm:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_max_norm)
                 self.optimizer.step()
             self.optimizer.zero_grad()
     
@@ -219,13 +228,14 @@ class Trainer:
         self.model.eval()
         with torch.autocast(device_type='cuda', dtype=torch.float16) if self.mixed_precision else nullcontext():
             with torch.no_grad():
-                for batch in dataloader:
+                for idx, batch in enumerate(dataloader):
                     inputs, targets = batch
                     inputs = inputs.to(self.gpu_id)
                     targets = targets.to(self.gpu_id)  # (batch_size,)
                     outputs = self.model(inputs)  # (batch_size, num_classes)
                     probs = F.softmax(outputs, dim=-1)  # (batch_size, num_classes)
                     probs_positive_class = probs[:,-1]  # (batch_size,)
+                    print(f"[GPU{self.gpu_id}] Validation Batch {idx}: \nTargets: {targets} \nOutputs: {torch.argmax(probs, dim=-1)}")
 
                     metrics_dict["avg_loss"] += self.loss_fn(outputs, targets)  
                     for metric, fn in torchmetrics_dict.items():
@@ -316,7 +326,12 @@ def set_seed_everywhere(seed: int):
     os.environ['PYTHONHASHSEED'] = str(seed)
 
 
-def _data_transform(image_size: Union[int, Tuple[int, int]], augment: str):
+def _data_transform(
+        image_size: Union[int, Tuple[int, int]], 
+        augment: str = None,
+        randaugment_num_ops: int = 2,
+        randaugment_mag: int = 9,
+    ):
     """
     Parameters
     ----------
@@ -325,48 +340,47 @@ def _data_transform(image_size: Union[int, Tuple[int, int]], augment: str):
             If int size is provided, input image size will be (size, size)
             If Tuple (height, width) is provided, input image size will be (height, width)
     augment : str
-        timm data augmentation config string: None, "rand-m#-n#-mstd#", or "augmix-m#-w#-d#-mstd#"
+        Data augmentation strategy: None, trivialaugment, randaugment, autoaugment, augmix; by default None
+    randaugment_num_ops : int
+        Number of operations for RandAugment; by default 2 to match PyTorch default
+    randaugment_mag : int
+        Magnitude of each operation for RandAugment (max 31); by default 9 to match PyTorch default
 
     Returns
     -------
-    Data transforms for specified data augmentation strategy
+    Data transforms with or without data augmentation strategy
     """
 
     transforms_list = [
-        transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BILINEAR),
+        transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
+        # transforms.CenterCrop(image_size),  # used for ImageNet and in original RETFound code but don't want to lose peripheral pathology
         transforms.ToTensor(),
         transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
     ]
 
     if augment is not None:
+        # torchvision data augmentations
+        augmentations = {
+            "trivialaugment": transforms.TrivialAugmentWide(),
+            "randaugment": transforms.RandAugment(num_ops=randaugment_num_ops, magnitude=randaugment_mag),
+            "autoaugment": transforms.AutoAugment(),
+            "augmix": transforms.AugMix(),
+        }
+        assert augment in augmentations, f"Data augmentation strategy must be one of {list(augmentations.keys())}"
+        transforms_list.insert(1, augmentations[augment])  #  insert after Resize
+
+        """
+        # timm data augmentations
         augment_strategy = augment.split("-")[0]
         assert augment_strategy in ["rand", "augmix"], "timm data augmentation config string must start with rand- or augmix-"
+        RGB_IMAGENET_DEFAULT_MEAN = tuple([min(255, round(255 * x)) for x in IMAGENET_DEFAULT_MEAN])
+        RGB_IMAGENET_DEFAULT_STD = tuple([min(255, round(255 * x)) for x in IMAGENET_DEFAULT_STD])
         if augment_strategy == "rand":  # insert RandAugment after Resize
-            transforms_list.insert(1, rand_augment_transform(config_string=augment, hparams={"img_mean": IMAGENET_DEFAULT_MEAN, "img_std": IMAGENET_DEFAULT_STD}))
+            transforms_list.insert(1, rand_augment_transform(config_str=augment, hparams={"img_mean": RGB_IMAGENET_DEFAULT_MEAN, "img_std": RGB_IMAGENET_DEFAULT_STD}))
         else:  # augment_strategy == "augmix" - insert AugMix after Resize
-            transforms_list.insert(1, augment_and_mix_transform(config_string=augment, hparams={"img_mean": IMAGENET_DEFAULT_MEAN, "img_std": IMAGENET_DEFAULT_STD}))
-    
+            transforms_list.insert(1, augment_and_mix_transform(config_string=augment, hparams={"img_mean": RGB_IMAGENET_DEFAULT_MEAN, "img_std": RGB_IMAGENET_DEFAULT_STD}))
+        """
     return transforms.Compose(transforms_list)
-
-    """
-    # torchvision data augmentations
-    augmentations = {
-        "trivialaugment": transforms.TrivialAugmentWide(),
-        "randaugment": transforms.RandAugment(num_ops=4, magnitude=12),
-        "autoaugment": transforms.AutoAugment(),
-        "augmix": transforms.AugMix(),
-    }
-    
-    for torchvision.transforms.v2
-    return transforms.Compose([
-        augmentations[augment],
-        transforms.Resize(RETFOUND_EXPECTED_IMAGE_SIZE, 
-                          interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(RETFOUND_EXPECTED_IMAGE_SIZE),  # or Resize([224, 224])? 
-        transforms.ToDtype(torch.float32, scale=True),
-        transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
-    ])
-    """
 
 
 def _cutmixup_collate_fn(batch):
@@ -409,36 +423,44 @@ def _setup_dataloader(dataset: Dataset, batch_size: int, sampler: torch.utils.da
 
 def setup_data(
         dataset_path: str, 
-        image_size: int,
+        image_size: Union[int, Tuple[int, int]],
         batch_size: int, 
         random_seed: int, 
-        resample: bool = False, 
-        num_augment_repeats: int = None,
-        dataset_size: int = None, 
-        augment: str = None, 
-        cutmixup: bool = False
+        resample: bool, 
+        num_augment_repeats: int,
+        dataset_size: int, 
+        augment: str, 
+        randaugment_num_ops: int,
+        randaugment_mag: int,
+        # cutmixup: bool,
     ):
     """
     Parameters
     ----------
     dataset_path : str
         Path to root directory of PyTorch ImageFolder dataset
-    image_size : int
-        Input image size for model; if -1, do not resize images
+    image_size : Union[int, Tuple[int, int]]
+        Input image size for model
+            If int size is provided, input image size will be (size, size)
+            If Tuple (height, width) is provided, input image size will be (height, width)
     batch_size : int
         Batch size for dataloaders
     random_seed : int
         Random seed for reproducibility
-    resample : bool, optional
-        Whether to resample training dataset to balance classes, by default False
-    num_augment_repeats : int, optional
-        Number of times to augment each image in the training dataset, by default 1
-    dataset_size : int, optional
+    resample : bool
+        Whether to resample training dataset to balance classes
+    num_augment_repeats : int
+        Number of times to augment each image in the training dataset
+    dataset_size : int
         Number of images to sample from the training set. Use all images if not specified.
-    augment : str, optional
-        Data augmentation strategy: None, "rand-m#-n#-mstd#", or "augmix-m#-w#-d#-mstd#"
-    cutmixup : bool, optional
-        Whether to use CutMix/MixUp data augmentation, by default False
+    augment : str
+        Data augmentation strategy: None, trivialaugment, randaugment, autoaugment, augmix
+    randaugment_num_ops : int
+        Number of operations for RandAugment
+    randaugment_mag : int
+        Magnitude of each operation for RandAugment
+    cutmixup : bool
+        Whether to use CutMix/MixUp data augmentation
     
     Returns
     -------
@@ -446,10 +468,18 @@ def setup_data(
         Dataloaders for training, validation, and test sets
     """
     # Set up data augmentations
-    train_collate_fn = _cutmixup_collate_fn if cutmixup else None
+    train_collate_fn = None  # _cutmixup_collate_fn if cutmixup else None
 
     # Set up datasets
-    train_dataset = datasets.ImageFolder(dataset_path + "/train", transform=_data_transform(image_size, augment))
+    train_dataset = datasets.ImageFolder(
+        dataset_path + "/train", 
+        transform=_data_transform(
+            image_size=image_size, 
+            augment=augment, 
+            randaugment_num_ops=randaugment_num_ops, 
+            randaugment_mag=randaugment_mag,
+        )
+    )
     val_dataset = datasets.ImageFolder(dataset_path + "/val", transform=_data_transform(image_size, augment=None))
     test_dataset = datasets.ImageFolder(dataset_path + "/test", transform=_data_transform(image_size, augment=None))
 
@@ -495,20 +525,39 @@ def setup_data(
     return train_dataloader, val_dataloader, test_dataloader
 
 
+"""
+    model = setup_model(
+        model_arch=args.model_arch, 
+        modality=args.modality, 
+        training_strategy=args.training_strategy, 
+        checkpoint_path=args.checkpoint_path, 
+        num_classes=args.num_classes,
+        image_size=(args.image_height, args.image_width),
+        layerscale_init_values=args.layerscale_init_values,
+        stochastic_depth_rate=args.stochastic_depth_rate,
+        patch_dropout_rate=args.patch_dropout_rate,
+        position_embedding_dropout_rate=args.position_embedding_dropout_rate,
+        attention_dropout_rate=args.attention_dropout_rate,
+        projection_dropout_rate=args.projection_dropout_rate,
+        head_dropout_rate=args.head_dropout_rate
+    )
+"""
+
 def setup_model(
         model_arch: str, 
         modality: str, 
         training_strategy: str,
-        checkpoint_path: str = None,
-        num_classes: int = 2, 
-        image_size: int = 224,
+        checkpoint_path: str,
+        num_classes: int, 
+        image_size: int,
+        layerscale_init_values: float,
+        stochastic_depth_rate: float,
+        patch_dropout_rate: float,
+        position_embedding_dropout_rate: float,     
+        attention_dropout_rate: float,
+        projection_dropout_rate: float, 
+        head_dropout_rate: float,
         global_pool: bool = False,
-        stochastic_depth_rate: float = 0.0,
-        patch_dropout_rate: float = 0.0,
-        position_embedding_dropout_rate: float = 0.0,     
-        attention_dropout_rate: float = 0.0,
-        projection_dropout_rate: float = 0.0, 
-        head_dropout_rate: float = 0.0
     ):
     """
     Parameters
@@ -519,26 +568,28 @@ def setup_model(
         Modality: CFP, OCT
     training_strategy : str
         Training strategy: full_finetune, linear_probe, surgical_finetune, sft_and_lp
-    checkpoint_path : str, optional
-        Path to model checkpoint to finetune from, by default None
-    num_classes : int, optional
-        Number of classes, by default 2
-    image_size : int, optional
-        Input image size, by default 224
-    global_pool : bool, optional
+    checkpoint_path : str
+        Path to model checkpoint to finetune from,
+    num_classes : int
+        Number of classes
+    image_size : int
+        Input image size
+    layerscale_init_values : float
+        Layer scale initialization values for ViT
+    stochastic_depth_rate : float
+        Stochastic depth rate for ViT
+    patch_dropout_rate : float
+        Patch dropout rate for ViT
+    position_embedding_dropout_rate : float
+        Position embedding dropout rate for ViT
+    attention_dropout_rate : float
+        Attention dropout rate for ViT
+    projection_dropout_rate : float
+        Projection layer dropout rate for ViT
+    head_dropout_rate : float
+        Classification head dropout rate for ViT
+    global_pool : bool
         Whether to use global average pooling, by default False
-    stochastic_depth_rate : float, optional
-        Stochastic depth rate for ViT, by default 0.0
-    patch_dropout_rate : float, optional
-        Patch dropout rate for ViT, by default 0.0
-    position_embedding_dropout_rate : float, optional
-        Position embedding dropout rate for ViT, by default 0.0
-    attention_dropout_rate : float, optional
-        Attention dropout rate for ViT, by default 0.0
-    projection_dropout_rate : float, optional
-        Projection layer dropout rate for ViT, by default 0.0
-    head_dropout_rate : float, optional
-        Classification head dropout rate for ViT, by default 0.0
     
     Returns
     -------
@@ -567,6 +618,7 @@ def setup_model(
             pretrained=True, 
             num_classes=num_classes,
             img_size=image_size,
+            init_values=layerscale_init_values,
             drop_path_rate=stochastic_depth_rate,
             patch_drop_rate=patch_dropout_rate,
             drop_rate=head_dropout_rate,
@@ -602,6 +654,7 @@ def setup_model(
             num_classes=num_classes,
             img_size=image_size,
             global_pool=global_pool,
+            init_values=layerscale_init_values,
             drop_path_rate=stochastic_depth_rate,
             patch_drop_rate=patch_dropout_rate,
             drop_rate=head_dropout_rate,
@@ -628,11 +681,12 @@ def setup_model(
         
         # load mae model state
         msg = model.load_state_dict(mae_checkpoint_model, strict=False)
-        # print(msg)
+        if int(os.environ["LOCAL_RANK"]) == 0:
+            print(msg)
         if global_pool:
-            assert set(msg.missing_keys) == {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}
+            assert set(msg.missing_keys) >= {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}  # >= means "is superset of"
         else:
-            assert set(msg.missing_keys) == {"head.weight", "head.bias"}
+            assert set(msg.missing_keys) >= {"head.weight", "head.bias"}  # >= means "is superset of"
        
         # manually initialize head fc layer following MoCo v3
         trunc_normal_(model.head.weight, std=.02)
@@ -673,7 +727,6 @@ def setup_model(
 def setup_optimizer(
         model: torch.nn.Module, 
         algo: str,
-        training_strategy: str, 
         lr: float, 
         weight_decay: float
     ):
@@ -684,8 +737,6 @@ def setup_optimizer(
         Model to train
     algo : str
         Optimization algorithm to use: adam, adamw, lars, lamb
-    training_strategy : str
-        Training strategy: full_finetune, linear_probe
     lr : float
         Learning rate
     weight_decay : float
@@ -833,7 +884,10 @@ def main(args):
         num_augment_repeats=args.num_augment_repeats,
         resample=args.resample, 
         dataset_size=args.dataset_size, 
-        augment=args.augment
+        augment=args.augment,
+        randaugment_num_ops=args.randaugment_num_ops,
+        randaugment_mag=args.randaugment_mag,
+        # cutmixup=args.cutmixup,
     )
     
     model = setup_model(
@@ -843,6 +897,7 @@ def main(args):
         checkpoint_path=args.checkpoint_path, 
         num_classes=args.num_classes,
         image_size=(args.image_height, args.image_width),
+        layerscale_init_values=args.layerscale_init_values,
         stochastic_depth_rate=args.stochastic_depth_rate,
         patch_dropout_rate=args.patch_dropout_rate,
         position_embedding_dropout_rate=args.position_embedding_dropout_rate,
@@ -851,7 +906,7 @@ def main(args):
         head_dropout_rate=args.head_dropout_rate
     )
     
-    optimizer = setup_optimizer(model, algo=args.optimizer, training_strategy=args.training_strategy, lr=args.learning_rate, weight_decay=args.weight_decay)
+    optimizer = setup_optimizer(model, algo=args.optimizer, lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = setup_lr_scheduler(optimizer, args.total_epochs, args.lr_scheduler, args.warmup_epochs) if args.lr_scheduler else None
     loss_fn = setup_loss_fn(modality=args.modality if args.weight_loss_fn else "none", label_smoothing=args.label_smoothing)
 
@@ -876,6 +931,7 @@ def main(args):
         scheduler=scheduler,
         loss_fn=loss_fn,
         mixed_precision=args.mixed_precision,
+        grad_clip_max_norm=args.grad_clip_max_norm,
         save_every=args.save_every,
         last_snapshot_path=last_snapshot_path,
         best_snapshot_path=best_snapshot_path,
@@ -938,13 +994,17 @@ if __name__ == "__main__":
     parser.add_argument('--warmup_epochs', type=int, default=0, help='epochs to warm up LR')
 
     # Data Augmentation
-    parser.add_argument('--augment', type=str, help='Data augmentation config string: None, "rand-m#-n#-mstd#", or "augmix-m#-w#-d#-mstd#"') 
+    parser.add_argument('--augment', type=str, help='Data augmentation strategy: None, trivialaugment, randaugment, autoaugment, augmix')
+    parser.add_argument('--randaugment_num_ops', type=int, default=2, help='Number of operations for RandAugment, default 2 to match PyTorch default')
+    parser.add_argument('--randaugment_mag', type=int, default=9, help='Magnitude of each operation for RandAugment, default 9 to match PyTorch default') 
     parser.add_argument('--num_augment_repeats', type=int, help='Number of augmented samples per sampled input image - RepeatedAugmentationSampler samples batch_size / num_augment_repeats input images per batch to maintain constant batch size')
-    # TODO: debug  # parser.add_argument('--cutmixup', type=bool, default=False, help='Whether to use CutMix/MixUp data augmentation')  
+    parser.add_argument('--cutmixup', action='store_true', help='Use CutMix/MixUp data augmentation')  
 
     # Regularization
+    parser.add_argument('--grad_clip_max_norm', type=float, help='Gradient clipping: clip gradient 2-norm to this value')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay')
     parser.add_argument('--label_smoothing', type=float, default=0.0, help='Add uniformly distributed smoothing when computing the loss; range 0.0-1.0 where 0.0 means no smoothing')
+    parser.add_argument('--layerscale_init_values', type=float, help='Layer scale initialization values for ViT, default None, commonly 1e-6')
     parser.add_argument('--stochastic_depth_rate', type=float, default=0.0, help='Stochastic depth rate for ViT')
     parser.add_argument('--patch_dropout_rate', type=float, default=0.0, help='Patch dropout rate for ViT')
     parser.add_argument('--position_embedding_dropout_rate', type=float, default=0.0, help='Position embedding dropout rate for ViT')
