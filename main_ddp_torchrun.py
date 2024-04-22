@@ -557,7 +557,7 @@ def setup_model(
         attention_dropout_rate: float,
         projection_dropout_rate: float, 
         head_dropout_rate: float,
-        global_pool: bool = False,
+        global_pool: str,
     ):
     """
     Parameters
@@ -588,8 +588,8 @@ def setup_model(
         Projection layer dropout rate for ViT
     head_dropout_rate : float
         Classification head dropout rate for ViT
-    global_pool : bool
-        Whether to use global average pooling, by default False
+    global_pool : str
+        Which global pooling to use for timm ViT (>=0.6.5): '', 'avg', 'token', 'map'
     
     Returns
     -------
@@ -683,7 +683,7 @@ def setup_model(
         msg = model.load_state_dict(mae_checkpoint_model, strict=False)
         if int(os.environ["LOCAL_RANK"]) == 0:
             print(msg)
-        if global_pool:
+        if global_pool == "avg":
             assert set(msg.missing_keys) >= {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}  # >= means "is superset of"
         else:
             assert set(msg.missing_keys) >= {"head.weight", "head.bias"}  # >= means "is superset of"
@@ -897,6 +897,7 @@ def main(args):
         checkpoint_path=args.checkpoint_path, 
         num_classes=args.num_classes,
         image_size=(args.image_height, args.image_width),
+        global_pool=args.global_pool,
         layerscale_init_values=args.layerscale_init_values,
         stochastic_depth_rate=args.stochastic_depth_rate,
         patch_dropout_rate=args.patch_dropout_rate,
@@ -979,7 +980,7 @@ if __name__ == "__main__":
     parser.add_argument('--model_arch', type=str, default="retfound", help='Model architecture: resnet50, vit_large, retfound')
     parser.add_argument('--checkpoint_path', type=str, help='Path to model checkpoint to finetune from')
     parser.add_argument('--training_strategy', type=str, default="full_finetune", help="Training strategy: full_finetune, linear_probe, surgical_finetune, sft_and_lp")  
-    # TODO: debug  # parser.add_argument('--global_average_pooling', action='store_true', help='Use global average pooling')  
+    parser.add_argument('--global_pool', type=str, default="", help='timm ViT global pooling: "", "avg", "token", "map"')  
  
     # Batch size (can increase with mixed precision, gradient accumulation), Number of epochs
     parser.add_argument('--mixed_precision', action='store_true', help='Use automatic mixed precision')

@@ -12,17 +12,17 @@ import timm.models.vision_transformer
 
 
 class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
-    """ Vision Transformer with support for global average pooling
+    """ Vision Transformer with support for global average pooling (for timm <= 0.5.4)
     """
     def __init__(self, global_pool=False, **kwargs):
         super(VisionTransformer, self).__init__(**kwargs)
-        self.global_pool = global_pool
+
         if self.global_pool:
             norm_layer = kwargs['norm_layer']
             embed_dim = kwargs['embed_dim']
             self.fc_norm = norm_layer(embed_dim)
 
-            del self.norm  # remove the original norm
+            self.norm = torch.nn.Identity()  # remove the original norm
 
     def forward_features(self, x):
         B = x.shape[0]
@@ -45,9 +45,12 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
         return outcome
 
-
+# For timm >=6.5, timm ViT has global average pooling by setting global_pool="avg"
+# -> use timm.models.vision_transformer.VisionTransformer directly
+# For timm <= 0.5.4, call VisionTransformer() implementation above
+# -> will need to change global_pool to boolean variable
 def vit_large_patch16(**kwargs):
-    model = VisionTransformer(
+    model = timm.models.vision_transformer.VisionTransformer(  
         patch_size=16, embed_dim=1024, depth=24, num_heads=16, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
