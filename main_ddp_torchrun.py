@@ -60,12 +60,13 @@ class Trainer:
             optimizer: torch.optim.Optimizer,
             scheduler: torch.optim.lr_scheduler,
             loss_fn: torch.nn.Module,
+            mixed_precision: bool,
+            grad_clip_max_norm: float,
+            sam: bool,
             save_every: int,
             last_snapshot_path: str,
             best_snapshot_path: str,
             test_snapshot_path: str = None,
-            mixed_precision: bool = False,
-            grad_clip_max_norm: float = None,
             evaluate_on_final_test_set: bool = False,
     ) -> None:
         # model, optimizer, loss
@@ -77,17 +78,26 @@ class Trainer:
             gradient_as_bucket_view=True,
             static_graph=False,  # errors when set to True
         )
-        self.grad_accum_steps = grad_accum_steps
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.loss_fn = loss_fn
-
-        # gradient clipping
+        
+        self.grad_accum_steps = grad_accum_steps
         self.grad_clip_max_norm = grad_clip_max_norm
 
         # mixed precision
         self.mixed_precision = mixed_precision
         self.scaler = torch.cuda.amp.GradScaler()  
+
+        # SAM 
+        self.sam = sam
+        if self.sam:
+            self.sam_optimizer = SAM(
+                params=self.model.module.parameters(), # actual model is module wrapped by DDP
+                base_optimizer=self.optimizer,
+                rho=2.0,  # from https://github.com/davda54/sam/blob/main/example/train.py
+                adaptive=True,  # from https://github.com/davda54/sam/blob/main/example/train.py
+            )
 
         # dataloaders
         self.train_dataloader = train_dataloader
@@ -147,8 +157,13 @@ class Trainer:
         print(f"[GPU{self.gpu_id}] Batch {index} | Class balance: {torch.bincount(targets)}")
         
         with torch.autocast(device_type='cuda', dtype=torch.float16) if self.mixed_precision else nullcontext():
-            with self.model.no_sync() if not take_gradient_step else nullcontext():
-                outputs = self.model(inputs)  # (batch_size, num_classes)
+            with self.model.no_sync() if not take_gradient_step else nullcontext():               
+                outputs = self.model(inputs)  
+                # global_pool="avg": (batch_size, num_classes) with global average pooling
+                # global_pool="": (batch_size, # tokens, num_classes) with no pooling -> outputs[:,0,:] gives cls token output (batch_size, num_classes)
+                # global_pool="token": (batch_size, num_classes) e.g. gives cls token output as above
+                # global_pool="map": ???
+                
                 loss = self.loss_fn(outputs, targets) / self.grad_accum_steps
                 preds = torch.argmax(outputs, dim=-1)  # (batch_size)
                 train_acc = torch.sum(preds == targets) / len(targets)
@@ -201,6 +216,8 @@ class Trainer:
                 wandb.log({"train_loss": loss, "train_acc": train_acc})
             
             loss.backward()
+            if self.grad_clip_max_norm:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_max_norm)
             self.sam_optimizer.first_step(zero_grad=True)
         
         # second forward-backward pass
@@ -208,7 +225,9 @@ class Trainer:
         outputs = self.model(inputs)  # (batch_size, num_classes)
         loss = self.loss_fn(outputs, targets)
         loss.backward()
-        self.optimizer.second_step(zero_grad=True)
+        if self.grad_clip_max_norm:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_max_norm)
+        self.sam_optimizer.second_step(zero_grad=True)
 
     def _validate(self, test: bool = False):
         """ Validate current model on validation or final test dataset"""
@@ -273,7 +292,10 @@ class Trainer:
             targets = targets.to(self.gpu_id)
             
             self.model.train()
-            self._train_batch(index, inputs, targets)
+            if self.sam:
+                self._train_sam_batch(index, inputs, targets)
+            else:
+                self._train_batch(index, inputs, targets)
         
         if self.scheduler:
             self.scheduler.step(epoch + 1)  # update learning rate every epoch if using LR scheduler (alternatively, update every step)
@@ -524,24 +546,6 @@ def setup_data(
 
     return train_dataloader, val_dataloader, test_dataloader
 
-
-"""
-    model = setup_model(
-        model_arch=args.model_arch, 
-        modality=args.modality, 
-        training_strategy=args.training_strategy, 
-        checkpoint_path=args.checkpoint_path, 
-        num_classes=args.num_classes,
-        image_size=(args.image_height, args.image_width),
-        layerscale_init_values=args.layerscale_init_values,
-        stochastic_depth_rate=args.stochastic_depth_rate,
-        patch_dropout_rate=args.patch_dropout_rate,
-        position_embedding_dropout_rate=args.position_embedding_dropout_rate,
-        attention_dropout_rate=args.attention_dropout_rate,
-        projection_dropout_rate=args.projection_dropout_rate,
-        head_dropout_rate=args.head_dropout_rate
-    )
-"""
 
 def setup_model(
         model_arch: str, 
@@ -875,7 +879,7 @@ def main(args):
     last_snapshot_path = args.snapshot_path + "/last.pth"
     best_snapshot_path = args.snapshot_path + "/best.pth"
 
-    # Set up training objects
+    # Set up dataset and data loader objects
     train_dataloader, val_dataloader, test_dataloader = setup_data(
         dataset_path=dataset_path, 
         image_size=(args.image_height, args.image_width),
@@ -890,6 +894,7 @@ def main(args):
         # cutmixup=args.cutmixup,
     )
     
+    # Set up model, optimizer, scheduler, loss function
     model = setup_model(
         model_arch=args.model_arch, 
         modality=args.modality, 
@@ -910,6 +915,10 @@ def main(args):
     optimizer = setup_optimizer(model, algo=args.optimizer, lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = setup_lr_scheduler(optimizer, args.total_epochs, args.lr_scheduler, args.warmup_epochs) if args.lr_scheduler else None
     loss_fn = setup_loss_fn(modality=args.modality if args.weight_loss_fn else "none", label_smoothing=args.label_smoothing)
+
+    if args.sam:
+        assert not args.mixed_precision, "SAM not yet supported with mixed precision training"
+        assert args.grad_accum_steps == 1, "SAM not yet supported with gradient accumulation"
 
     # Set up W&B logging 
     gpu_id = int(os.environ["LOCAL_RANK"])
@@ -933,6 +942,7 @@ def main(args):
         loss_fn=loss_fn,
         mixed_precision=args.mixed_precision,
         grad_clip_max_norm=args.grad_clip_max_norm,
+        sam=args.sam,
         save_every=args.save_every,
         last_snapshot_path=last_snapshot_path,
         best_snapshot_path=best_snapshot_path,
@@ -980,7 +990,7 @@ if __name__ == "__main__":
     parser.add_argument('--model_arch', type=str, default="retfound", help='Model architecture: resnet50, vit_large, retfound')
     parser.add_argument('--checkpoint_path', type=str, help='Path to model checkpoint to finetune from')
     parser.add_argument('--training_strategy', type=str, default="full_finetune", help="Training strategy: full_finetune, linear_probe, surgical_finetune, sft_and_lp")  
-    parser.add_argument('--global_pool', type=str, default="", help='timm ViT global pooling: "", "avg", "token", "map"')  
+    parser.add_argument('--global_pool', type=str, default="token", help='timm ViT global pooling: "", "avg" (for global average pooling), "token" (use class token), "map" (?)')  
  
     # Batch size (can increase with mixed precision, gradient accumulation), Number of epochs
     parser.add_argument('--mixed_precision', action='store_true', help='Use automatic mixed precision')
@@ -990,9 +1000,10 @@ if __name__ == "__main__":
     
     # Optimizer, Learning Rate, Learning Rate Schedule
     parser.add_argument('--optimizer', type=str, default="lars", help='Optimizer: adam, adamw, lars, lamb')
+    parser.add_argument('--sam', action='store_true', help='Use Sharpness-Aware Minimization')
     parser.add_argument('--learning_rate', type=float, default=0.3, help='Learning rate')
     parser.add_argument('--lr_scheduler', type=str, help='Learning rate scheduler: cosine, poly, step')  
-    parser.add_argument('--warmup_epochs', type=int, default=0, help='epochs to warm up LR')
+    parser.add_argument('--warmup_epochs', type=int, default=0, help='Epochs to warm up LR')
 
     # Data Augmentation
     parser.add_argument('--augment', type=str, help='Data augmentation strategy: None, trivialaugment, randaugment, autoaugment, augmix')

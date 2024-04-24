@@ -21,7 +21,6 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             norm_layer = kwargs['norm_layer']
             embed_dim = kwargs['embed_dim']
             self.fc_norm = norm_layer(embed_dim)
-
             self.norm = torch.nn.Identity()  # remove the original norm
 
     def forward_features(self, x):
