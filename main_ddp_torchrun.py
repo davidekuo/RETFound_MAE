@@ -24,7 +24,6 @@ from torchvision import datasets, transforms
 # import torchvision.transforms.v2 as transforms_v2
 
 import timm
-from timm.data.auto_augment import rand_augment_transform, augment_and_mix_transform
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.models.layers import trunc_normal_
 from timm.optim import Lamb
@@ -35,7 +34,7 @@ from timm.scheduler.step_lr import StepLRScheduler
 import models_vit
 from util.lars import LARS
 from util.pos_embed import interpolate_pos_embed
-from util.sam import SAM, disable_running_stats, enable_running_stats
+from util.sam import SAM, disable_running_stats, enable_running_stats, SAMOptimizer, ClosureGradScaler
 from util.samplers import DistributedSamplerWrapper, RepeatedAugmentationSampler
 
 CFP_CHKPT_PATH = "/home/dkuo/RetFound/model_checkpoints/RETFound_cfp_weights.pth"
@@ -93,12 +92,21 @@ class Trainer:
         self.sam = sam
         if self.sam:
             self.sam_optimizer = SAM(
-                params=self.model.module.parameters(), # actual model is module wrapped by DDP
                 base_optimizer=self.optimizer,
-                rho=2.0,  # from https://github.com/davda54/sam/blob/main/example/train.py
-                adaptive=True,  # from https://github.com/davda54/sam/blob/main/example/train.py
+                rho=0.05,
+                adaptive=True,  
+                # Suggested by https://github.com/davda54/sam/blob/main/example/train.py
             )
-
+            """
+            self.optimizer = SAMOptimizer(
+                self.optimizer, 
+                rho=0.05, 
+                epsilon=1e-12, 
+                interval=1
+            )
+            self.scaler = ClosureGradScaler()
+            """
+            
         # dataloaders
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
@@ -217,7 +225,7 @@ class Trainer:
             
             loss.backward()
             if self.grad_clip_max_norm:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_max_norm)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_max_norm)
             self.sam_optimizer.first_step(zero_grad=True)
         
         # second forward-backward pass
@@ -226,8 +234,55 @@ class Trainer:
         loss = self.loss_fn(outputs, targets)
         loss.backward()
         if self.grad_clip_max_norm:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_max_norm)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_max_norm)
         self.sam_optimizer.second_step(zero_grad=True)
+
+    def _train_sam_batch_closure(self, index: int, inputs: torch.Tensor, targets: torch.Tensor):
+        """ Train on one batch with SAM optimizer (Sharpness-Aware Minimization) using closure """
+        
+        # Check class balance (for resampling)
+        print(f"[GPU{self.gpu_id}] Batch {index} | Class balance: {torch.bincount(targets)}")
+
+        def closure():
+            with self.model.no_sync():
+                self.optimizer.zero_grad()
+                outputs = self.model(inputs)
+                loss = self.loss_fn(outputs, targets)
+                self.scaler.scale(loss).backward()
+                return loss
+        
+        with torch.autocast(device_type='cuda', dtype=torch.float16) if self.mixed_precision else nullcontext():
+            outputs = self.model(inputs)  
+            # global_pool="avg": (batch_size, num_classes) with global average pooling
+            # global_pool="": (batch_size, # tokens, num_classes) with no pooling -> outputs[:,0,:] gives cls token output (batch_size, num_classes)
+            # global_pool="token": (batch_size, num_classes) e.g. gives cls token output as above
+            # global_pool="map": ???
+            
+            loss = self.loss_fn(outputs, targets)
+            preds = torch.argmax(outputs, dim=-1)  # (batch_size)
+            train_acc = torch.sum(preds == targets) / len(targets)
+            print(f"[GPU{self.gpu_id}] Training loss: {loss}, Training accuracy: {train_acc}")
+
+            # avg across all GPUs and send to rank 0 process
+            torch.distributed.reduce(loss, op=torch.distributed.ReduceOp.AVG, dst=0)
+            torch.distributed.reduce(train_acc, op=torch.distributed.ReduceOp.AVG, dst=0)
+            if self.gpu_id == 0:
+                print(f"[MEAN] Training loss: {loss}, Training accuracy: {train_acc} \n")
+                wandb.log({"train_loss": loss, "train_acc": train_acc})
+            
+            self.scaler.scale(loss).backward() if self.mixed_precision else loss.backward()
+        
+        if self.mixed_precision:
+            if self.grad_clip_max_norm:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_max_norm)
+            self.scaler.step(self.optimizer, closure=closure)
+            self.scaler.update()
+        else:
+            if self.grad_clip_max_norm:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_max_norm)
+            self.optimizer.step()
+        self.optimizer.zero_grad()
 
     def _validate(self, test: bool = False):
         """ Validate current model on validation or final test dataset"""
