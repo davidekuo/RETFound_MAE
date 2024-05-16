@@ -24,7 +24,8 @@ from torchvision import datasets, transforms
 # import torchvision.transforms.v2 as transforms_v2
 
 import timm
-from timm.data.auto_augment import rand_augment_transform, augment_and_mix_transform
+# from timm.data.auto_augment import rand_augment_transform, augment_and_mix_transform
+# from timm.data import ImageDataset, AugMixDataset
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.models.layers import trunc_normal_
 from timm.optim import Lamb
@@ -93,9 +94,8 @@ class Trainer:
         self.sam = sam
         if self.sam:
             self.sam_optimizer = SAM(
-                params=self.model.module.parameters(), # actual model is module wrapped by DDP
                 base_optimizer=self.optimizer,
-                rho=2.0,  # from https://github.com/davda54/sam/blob/main/example/train.py
+                rho=0.05,  # from https://github.com/davda54/sam/blob/main/example/train.py
                 adaptive=True,  # from https://github.com/davda54/sam/blob/main/example/train.py
             )
 
@@ -353,6 +353,8 @@ def _data_transform(
         augment: str = None,
         randaugment_num_ops: int = 2,
         randaugment_mag: int = 9,
+        random_resize_crop: bool = False,
+        random_erase: bool = False,
     ):
     """
     Parameters
@@ -367,6 +369,10 @@ def _data_transform(
         Number of operations for RandAugment; by default 2 to match PyTorch default
     randaugment_mag : int
         Magnitude of each operation for RandAugment (max 31); by default 9 to match PyTorch default
+    random_resize_crop : bool
+        Whether to use random resized crop for data augmentation; by default False
+    random_erase : bool
+        Whether to use random erasing for data augmentation; by default False
 
     Returns
     -------
@@ -402,6 +408,13 @@ def _data_transform(
         else:  # augment_strategy == "augmix" - insert AugMix after Resize
             transforms_list.insert(1, augment_and_mix_transform(config_string=augment, hparams={"img_mean": RGB_IMAGENET_DEFAULT_MEAN, "img_std": RGB_IMAGENET_DEFAULT_STD}))
         """
+    
+    if random_resize_crop:
+        transforms_list[0] = transforms.RandomResizedCrop(size=image_size, antialias=True)  # replacing simple resize
+    
+    if random_erase:
+        transforms_list.append(transforms.RandomErasing())
+
     return transforms.Compose(transforms_list)
 
 
@@ -454,6 +467,8 @@ def setup_data(
         augment: str, 
         randaugment_num_ops: int,
         randaugment_mag: int,
+        random_resize_crop: bool,
+        random_erase: bool,
         # cutmixup: bool,
     ):
     """
@@ -481,6 +496,10 @@ def setup_data(
         Number of operations for RandAugment
     randaugment_mag : int
         Magnitude of each operation for RandAugment
+    random_resize_crop : bool
+        Whether to use random resized crop for data augmentation
+    random_erase : bool
+        Whether to use random erasing for data augmentation
     cutmixup : bool
         Whether to use CutMix/MixUp data augmentation
     
@@ -500,6 +519,8 @@ def setup_data(
             augment=augment, 
             randaugment_num_ops=randaugment_num_ops, 
             randaugment_mag=randaugment_mag,
+            random_resize_crop=random_resize_crop,
+            random_erase=random_erase,
         )
     )
     val_dataset = datasets.ImageFolder(dataset_path + "/val", transform=_data_transform(image_size, augment=None))
@@ -891,6 +912,8 @@ def main(args):
         augment=args.augment,
         randaugment_num_ops=args.randaugment_num_ops,
         randaugment_mag=args.randaugment_mag,
+        random_resize_crop=args.random_resize_crop,
+        random_erase=args.random_erase,
         # cutmixup=args.cutmixup,
     )
     
@@ -1009,6 +1032,8 @@ if __name__ == "__main__":
     parser.add_argument('--augment', type=str, help='Data augmentation strategy: None, trivialaugment, randaugment, autoaugment, augmix')
     parser.add_argument('--randaugment_num_ops', type=int, default=2, help='Number of operations for RandAugment, default 2 to match PyTorch default')
     parser.add_argument('--randaugment_mag', type=int, default=9, help='Magnitude of each operation for RandAugment, default 9 to match PyTorch default') 
+    parser.add_argument('--random_resize_crop', action='store_true', help='Use random resized crop for data augmentation')
+    parser.add_argument('--random_erase', action='store_true', help='Use random erasing for data augmentation')
     parser.add_argument('--num_augment_repeats', type=int, help='Number of augmented samples per sampled input image - RepeatedAugmentationSampler samples batch_size / num_augment_repeats input images per batch to maintain constant batch size')
     parser.add_argument('--cutmixup', action='store_true', help='Use CutMix/MixUp data augmentation')  
 
