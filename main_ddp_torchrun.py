@@ -95,8 +95,8 @@ class Trainer:
         if self.sam:
             self.sam_optimizer = SAM(
                 base_optimizer=self.optimizer,
-                rho=0.05,  # from https://github.com/davda54/sam/blob/main/example/train.py
-                adaptive=True,  # from https://github.com/davda54/sam/blob/main/example/train.py
+                # rho=0.05,  # from https://github.com/davda54/sam/blob/main/example/train.py
+                # adaptive=True,  # from https://github.com/davda54/sam/blob/main/example/train.py
             )
 
         # dataloaders
@@ -110,7 +110,7 @@ class Trainer:
         self.last_snapshot_path = last_snapshot_path
         self.best_snapshot_path = best_snapshot_path
         self.test_snapshot_path = test_snapshot_path
-        self.best_val_f1 = 0.0  # given imbalanced dataset
+        self.best_val_f1 = 0.0  # CHECK HERE IF CHANGING BEST VAL METRIC
 
         if os.path.exists(last_snapshot_path):
             print("Loading snapshot")
@@ -126,12 +126,13 @@ class Trainer:
         self.model.module.load_state_dict(snapshot["model"])  # alternatively, use self.model.load_state_dict(...) but save self.model.state_dict() in _save_snapshot()
         self.optimizer.load_state_dict(snapshot["optimizer"])
         self.epochs_run = snapshot["epoch"]
-        self.best_val_f1 = snapshot["best_val_f1"]
+        self.best_val_f1 = snapshot["best_val_f1"]  # CHECK HERE IF CHANGING BEST VAL METRIC
         if self.scheduler is not None:
             self.scheduler.load_state_dict(snapshot["scheduler"])
         if self.mixed_precision:
             self.scaler.load_state_dict(snapshot["scaler"]) 
-        print(f"Successfully loaded snapshot from Epoch {self.epochs_run}. Best validation F1 so far: {self.best_val_f1}")
+        print(f"Successfully loaded snapshot from Epoch {self.epochs_run}.") 
+        print(f"Best validation F1 so far: {self.best_val_f1}")  # CHECK HERE IF CHANGING BEST VAL METRIC
     
     def _save_snapshot(self, epoch: int, snapshot_path: str):
         """ Save snapshot of current model """
@@ -139,7 +140,7 @@ class Trainer:
             "model": self.model.module.state_dict(),  # actual model is module wrapped by DDP
             "optimizer": self.optimizer.state_dict(),
             "epoch": epoch,
-            "best_val_f1": self.best_val_f1,
+            "best_val_f1": self.best_val_f1,  # CHECK HERE IF CHANGING BEST VAL METRIC
         }
         if self.scheduler is not None:
             snapshot["scheduler"] = self.scheduler.state_dict()    
@@ -313,9 +314,9 @@ class Trainer:
                 print("==================================== \n")
                 if epoch % self.save_every == 0:
                     self._save_snapshot(epoch, self.last_snapshot_path)
-                if self.best_val_f1 < metrics_dict["val_f1"]:
+                if self.best_val_f1 < metrics_dict["val_f1"]:  # CHECK HERE IF CHANGING BEST VAL METRIC
                     self._save_snapshot(epoch, self.best_snapshot_path)
-                    self.best_val_f1 = metrics_dict["val_f1"]
+                    self.best_val_f1 = metrics_dict["val_f1"]  # CHECK HERE IF CHANGING BEST VAL METRIC
         
         if self.evaluate_on_final_test_set:
             print(f"Finished training for {max_epochs} epochs. Evaluating best model snapshot on final test set")
@@ -692,34 +693,52 @@ def setup_model(
         mae_checkpoint_path = checkpoint_path if checkpoint_path else (OCT_CHKPT_PATH if modality == "OCT" else CFP_CHKPT_PATH)
         print(f"Loading model weights from {mae_checkpoint_path}")
         mae_checkpoint = torch.load(mae_checkpoint_path, map_location='cpu')
-        mae_checkpoint_model = mae_checkpoint["model"]
+        mae_checkpoint_state_dict = mae_checkpoint["model"]
         state_dict = model.state_dict()
         
         # adapt mae model to vit model
         for k in ["head.weight", "head.bias"]:
-            if k in mae_checkpoint_model and mae_checkpoint_model[k].shape != state_dict[k].shape:
+            if k in mae_checkpoint_state_dict and mae_checkpoint_state_dict[k].shape != state_dict[k].shape:
                 print(f"Removing key {k} from checkpoint due to shape mismatch")
-                del mae_checkpoint_model[k]
-        
+                del mae_checkpoint_state_dict[k]
+
         # interpolate position embedding following DeiT
-        interpolate_pos_embed(model, mae_checkpoint_model)
-        
+        interpolate_pos_embed(model, mae_checkpoint_state_dict)  
+        # interpolates mae_checkpoint_state_dict['pos_embed'] to match model['pos_embed']
+
         # load mae model state
-        msg = model.load_state_dict(mae_checkpoint_model, strict=False)
+        msg = model.load_state_dict(mae_checkpoint_state_dict, strict=False)
         if int(os.environ["LOCAL_RANK"]) == 0:
             print(msg)
-        if global_pool == "avg":
-            assert set(msg.missing_keys) >= {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}  # >= means "is superset of"
-        else:
-            assert set(msg.missing_keys) >= {"head.weight", "head.bias"}  # >= means "is superset of"
-       
-        # manually initialize head fc layer following MoCo v3
-        trunc_normal_(model.head.weight, std=.02)
+
+        # if mae_checkpoint_state_dict doesn't have weights for head.weight or head.bias,
+        # (e.g. no additional pretraining or linear probing beyond original RETFound weights)
+        # then manually initialize classification head
+        if set(msg.missing_keys) >= {'head.weight', 'head.bias'}:  # >= means "is superset of"
+
+            if global_pool == "avg":
+                assert set(msg.missing_keys) >= {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}
+            
+            # if head.1.weight and head.1.bias are present, use these for head.weight, head.bias
+            # as revising model head with batchnorm during linear probing changes parameter names
+            if set(msg.unexpected_keys) >= {'head.1.weight', 'head.1.bias'}:
+                model.head.weight = torch.nn.parameter.Parameter(
+                    mae_checkpoint_state_dict['head.1.weight']
+                )
+                model.head.bias = torch.nn.parameter.Parameter(
+                    mae_checkpoint_state_dict['head.1.bias']
+                )
+
+            else: # state_dict has no head.weight or head.bias 
+                # manually initialize head fc layer following MoCo v3
+                trunc_normal_(model.head.weight, std=0.02)  # 2e-5
 
         # linear probing - freeze all parameters but the head
         if training_strategy == "linear_probe":
             # hack for linear probe: revise model head with batchnorm
+            # NOTE: changes 'head.weight' -> 'head.1.weight', 'head.bias' -> 'head.1.bias'
             model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), model.head)
+
             # freeze all parameters but the head
             for name, param in model.named_parameters():
                 param.requires_grad = False
@@ -731,19 +750,23 @@ def setup_model(
         if training_strategy == "surgical_finetune":
             for name, param in model.named_parameters():
                 param.requires_grad = False
+            model.pos_embed.requires_grad = True
             for name, param in model.patch_embed.named_parameters():
                 param.requires_grad = True
-            model.pos_embed.requires_grad = True
+            for name, param in model.blocks[0].named_parameters():
+                param.requires_grad = True
         
         if training_strategy == "sft_and_lp":
-            # freeze all parameters but the head and embedding layers
+            # freeze all parameters but the embedding layers, classification head, and cls token
             for name, param in model.named_parameters():
                 param.requires_grad = False
-            for name, param in model.head.named_parameters():
-                param.requires_grad = True
+            model.pos_embed.requires_grad = True
             for name, param in model.patch_embed.named_parameters():
                 param.requires_grad = True
-            model.pos_embed.requires_grad = True
+            for name, param in model.head.named_parameters():
+                param.requires_grad = True
+            model.cls_token.requires_grad = True
+            
     
     model = model.to(memory_format=torch.channels_last)  # for faster training with convolutional, pooling layers
     return model
@@ -980,6 +1003,7 @@ def main(args):
     # Otherwise, train model
     else: 
         trainer.train(args.total_epochs)
+
         # If training finishes successfully, delete the last.pth model snapshot using gpu 0
         # and rename best.pth to [wandb_run_name].pth
         if gpu_id == 0:
